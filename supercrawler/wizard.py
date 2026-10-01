@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional
 
+import os
+
 from .config import CrawlConfig, get_preset
 from .discovery import candidate_sitemaps, probe_site
 
@@ -32,6 +34,22 @@ GOALS = {
 }
 
 SCOPES = ("whole site", "a section/path", "single page", "custom URL list")
+
+AUTH_MODES = (
+    "no login (public pages only)",
+    "sign in with a login form",
+    "reuse a saved session (cookies)",
+    "send a fixed auth header",
+)
+
+
+def _prompt_secret(message: str, prompter: Prompter) -> str:
+    """Read a secret without echoing it, falling back to plain input."""
+    try:
+        import getpass
+        return getpass.getpass(message)
+    except (ImportError, OSError, EOFError):
+        return (prompter(message) or "").strip()
 
 
 def _default_input(prompt: str) -> str:
@@ -133,7 +151,7 @@ def build_plan(
     print("  SuperCrawler setup")
     print("=" * 58)
 
-    print("\nStep 1/6 - what should we crawl?")
+    print("\nStep 1/7 - what should we crawl?")
     base_raw = _ask("site URL or domain", "", prompter)
     if not base_raw:
         raise ValueError("a site URL is required")
@@ -141,11 +159,11 @@ def build_plan(
     if not base_url:
         raise ValueError("could not understand that URL: %r" % base_raw)
 
-    scope_index = _ask_choice("Step 2/6 - how much of it?", list(SCOPES), 0, prompter)
+    scope_index = _ask_choice("Step 2/7 - how much of it?", list(SCOPES), 0, prompter)
     scope = SCOPES[scope_index]
 
     goal_index = _ask_choice(
-        "Step 3/6 - what are you collecting?",
+        "Step 3/7 - what are you collecting?",
         [GOALS[key]["label"] for key in GOALS],
         0,
         prompter,
@@ -167,7 +185,7 @@ def build_plan(
     elif scope == "single page":
         include_patterns = [r"^%s$" % _escape(base_url)]
 
-    print("\nStep 4/6 - limits")
+    print("\nStep 4/7 - limits")
     limits = [
         "unlimited (whole site, stops when links run out)",
         "up to 100 pages (quick sample)",
@@ -182,7 +200,7 @@ def build_plan(
     max_pages = _ask_int("  max pages (0 = unlimited)", max_pages, prompter)
 
     preset_index = _ask_choice(
-        "\nStep 5/6 - crawl speed",
+        "\nStep 5/7 - crawl speed",
         ["polite (slowest, safest)", "balanced (recommended)", "fast (loudest)"],
         1,
         prompter,
@@ -195,7 +213,7 @@ def build_plan(
 
     user_agent = _ask("  User-Agent", preset.user_agent, prompter)
 
-    print("\nStep 6/6 - extras")
+    print("\nStep 6/7 - extras")
     respect_robots = _ask_yes_no("  obey robots.txt?", True, prompter)
     use_sitemap = _ask_yes_no("  use sitemap.xml to find pages?", True, prompter)
     dedupe = _ask_yes_no("  skip duplicate content?", True, prompter)
@@ -203,6 +221,8 @@ def build_plan(
     follow_external = _ask_yes_no("  follow links to other domains?", False, prompter)
     output_dir = _ask("  output directory", "output", prompter)
     extra_excludes = _ask_list("  URL patterns to skip (regex, optional)", prompter)
+
+    auth = _ask_auth(prompter, output_dir)
 
     seeds = [base_url] + extra_seeds
     excludes = list(goal["exclude"]) + extra_excludes
@@ -223,6 +243,13 @@ def build_plan(
         include_patterns=tuple(include_patterns) if include_patterns else None,
         exclude_patterns=tuple(excludes) if excludes else None,
         output_dir=output_dir,
+        login_url=auth.get("login_url", ""),
+        login_username=auth.get("login_username", ""),
+        login_password=auth.get("login_password", ""),
+        login_password_env=auth.get("login_password_env", ""),
+        auth_header=auth.get("auth_header", ""),
+        session_file=auth.get("session_file", ""),
+        require_login=auth.get("require_login", False),
     )
 
     plan: Dict = {
@@ -269,9 +296,73 @@ def build_plan(
     if not respect_robots:
         print("\n  NOTE: robots.txt is disabled. Only crawl sites you own or are")
         print("        authorized to crawl.")
+    if auth.get("login_url"):
+        print("  login        : %s as %s"
+              % (auth.get("login_url"), auth.get("login_username") or "-"))
+        print("  password     : %s"
+              % ("typed in, this run only" if auth.get("login_password")
+                 else "from $%s" % auth.get("login_password_env")))
+    elif auth.get("session_file"):
+        print("  session      : %s" % auth["session_file"])
+    elif auth.get("auth_header"):
+        print("  auth header  : %s" % auth["auth_header"].split(":")[0])
+    if auth:
+        print("\n  Only continue if you are authorized to access this site.")
     print("=" * 58)
 
     return {"config": config, "base_url": base_url, "plan": plan}
+
+
+def _ask_auth(prompter: Prompter, output_dir: str) -> Dict:
+    """Collect account details. Only for sites the user is authorized to use."""
+    print("\nStep 7/7 - access (optional)")
+    choice = _ask_choice("  how do you want to authenticate?", list(AUTH_MODES), 0,
+                         prompter)
+
+    if choice == 1:
+        login_url = _ask("    login page URL", "", prompter)
+        if not login_url:
+            print("    no login URL given, continuing without a session")
+            return {}
+        login_url = normalize_site_input(login_url)
+        username = _ask("    username", "", prompter)
+        password_env = _ask("    env var holding the password",
+                            "SUPERCRAWLER_PASSWORD", prompter)
+
+        answer = prompter("    is %s already set in your shell? [Y/n]: "
+                          % password_env).strip().lower()
+        password = ""
+        if answer in ("n", "no"):
+            # Typed here it would land in this process only, never on disk.
+            password = _prompt_secret("    password (not echoed): ", prompter)
+            print("    kept in memory for this run only, not written to any file")
+        else:
+            print("    will read it from %s" % password_env)
+
+        require = _ask_yes_no("    abort if the login fails?", True, prompter)
+        return {
+            "login_url": login_url,
+            "login_username": username,
+            "login_password": password,
+            "login_password_env": password_env,
+            "session_file": os.path.join(output_dir, "session.json"),
+            "require_login": require,
+        }
+
+    if choice == 2:
+        path = _ask("    session file to reuse", os.path.join(output_dir,
+                                                              "session.json"),
+                    prompter)
+        print("    make sure you already logged in once to create it")
+        return {"session_file": path, "require_login": True}
+
+    if choice == 3:
+        header = _ask("    header, e.g. 'Authorization: Bearer ...'", "", prompter)
+        if not header:
+            return {}
+        return {"auth_header": header}
+
+    return {}
 
 
 def _escape(text: str) -> str:

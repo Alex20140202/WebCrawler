@@ -327,11 +327,18 @@ class Authenticator:
         return bool(self.config.login_url or self.config.auth_header)
 
     def password(self) -> str:
-        """Read the password from config, preferring an environment variable."""
+        """Resolve the password: an explicit inline value wins over the env var.
+
+        Inline is only a fallback for people driving the library; the CLI
+        prefers --password-env. We log which one was used so a surprise is
+        visible in the output rather than silently changing behaviour.
+        """
         if self.config.login_password:
+            if os.environ.get(self.config.password_env_name):
+                self._log("using the inline password and ignoring %s"
+                          % self.config.password_env_name)
             return self.config.login_password
-        env_name = self.config.login_password_env or "SUPERCRAWLER_PASSWORD"
-        return os.environ.get(env_name, "")
+        return os.environ.get(self.config.password_env_name, "")
 
     def prepare(self) -> Dict:
         """Apply a saved session and/or an auth header before crawling."""
@@ -361,9 +368,8 @@ class Authenticator:
         password = self.password()
 
         if not username or not password:
-            env_name = self.config.login_password_env or "SUPERCRAWLER_PASSWORD"
             self._log("login configured but credentials are missing "
-                      "(set %s in the environment)" % env_name)
+                      "(set %s in the environment)" % self.config.password_env_name)
             return LoginResult(False, "form", "missing credentials")
 
         try:

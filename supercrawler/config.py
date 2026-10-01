@@ -77,12 +77,6 @@ class CrawlConfig:
             raise ValueError("max_questions cannot be negative")
         if self.max_actions_per_page < 0:
             raise ValueError("max_actions_per_page cannot be negative")
-        if self.login_url and self.login_password and self.login_password_env:
-            if self.login_password_env and os.environ.get(self.login_password_env):
-                raise ValueError(
-                    "set the password either inline or via %s, not both"
-                    % self.login_password_env
-                )
         if self.auth_header and ":" not in self.auth_header \
                 and "=" not in self.auth_header:
             raise ValueError("auth_header must look like 'Name: value' or 'Name=value'")
@@ -90,6 +84,10 @@ class CrawlConfig:
     @property
     def has_login(self) -> bool:
         return bool(self.login_url or self.auth_header or self.session_file)
+
+    @property
+    def password_env_name(self) -> str:
+        return self.login_password_env or "SUPERCRAWLER_PASSWORD"
 
     @property
     def unlimited_depth(self) -> bool:

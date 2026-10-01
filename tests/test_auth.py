@@ -319,12 +319,30 @@ class CrawlWithLoginTests(unittest.TestCase):
             result = crawl(config, logger=None)
         self.assertNotIn(OK_PASS, json.dumps(result["summary"]))
 
-    def test_config_rejects_conflicting_password_sources(self):
-        with mock.patch.dict(os.environ, {"SUPERCRAWLER_PASSWORD": "x"}):
+    def test_inline_password_wins_over_a_set_env_var(self):
+        """An env var being present must not break an explicit inline password."""
+        with mock.patch.dict(os.environ, {"SUPERCRAWLER_PASSWORD": "from-env"}):
             config = CrawlConfig(login_url="https://x.test/login",
-                                 login_username="u", login_password="p")
-            with self.assertRaises(ValueError):
-                config.validate()
+                                 login_username="u", login_password="inline")
+            config.validate()
+            import requests
+            fetcher = Fetcher(config)
+            authenticator = Authenticator(fetcher.session, config)
+            self.assertEqual(authenticator.password(), "inline")
+
+    def test_password_source_reported_honestly(self):
+        config = CrawlConfig(login_url="https://x.test/login",
+                             login_username="u", login_password="inline")
+        self.assertEqual(describe_auth(config)["password_source"], "inline")
+        env_only = CrawlConfig(login_url="https://x.test/login",
+                               login_username="u",
+                               login_password_env="MY_PW")
+        self.assertEqual(describe_auth(env_only)["password_source"],
+                         "environment:MY_PW")
+
+    def test_password_env_name_has_a_default(self):
+        self.assertEqual(CrawlConfig().password_env_name, "SUPERCRAWLER_PASSWORD")
+        self.assertEqual(CrawlConfig(login_password_env="X").password_env_name, "X")
 
     def test_config_rejects_malformed_auth_header(self):
         config = CrawlConfig(auth_header="just-a-token")

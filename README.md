@@ -23,21 +23,86 @@ python3 crawl.py https://example.com --smart --auto
 
 ## Logging in
 
-For sites you own or are authorized to crawl:
+For sites you own or are authorized to crawl.
+
+### Option 1 - environment variable (recommended)
+
+The password never touches the command line, so it stays out of shell history and
+process listings.
 
 ```bash
-# password from an environment variable, session reused on later runs
+# for the current shell only
 export SUPERCRAWLER_PASSWORD='...'
+
+# or read it without echoing, and forget it when you are done
+read -s SUPERCRAWLER_PASSWORD && export SUPERCRAWLER_PASSWORD
+
+# or pull it from a password manager
+export SUPERCRAWLER_PASSWORD="$(op read 'op://private/intranet/password')"
+export SUPERCRAWLER_PASSWORD="$(security find-generic-password -s intranet -w)"
+
 python3 crawl.py https://intranet.example.com/dashboard \
   --login-url https://intranet.example.com/login -u alice --require-login
+```
 
-# a token header instead of a form (API docs, CI systems)
+Use `--password-env MY_VAR` to read from a differently named variable.
+
+### Option 2 - the wizard
+
+`--wizard` now asks about access as its last step, and offers four modes:
+
+```
+Step 7/7 - access (optional)
+  how do you want to authenticate?
+  * 1) no login (public pages only)
+    2) sign in with a login form
+    3) reuse a saved session (cookies)
+    4) send a fixed auth header
+```
+
+Choosing "sign in with a login form" asks for the login page, the username, and
+the name of the env var. If that variable is not already exported, it offers to
+prompt you for the value with `getpass`, so it is not echoed and is kept in memory
+for that run only.
+
+### Option 3 - a token header instead of a form
+
+For API docs, CI systems, and anything that authenticates by header:
+
+```bash
 python3 crawl.py https://api.example.com \
   --auth-header 'Authorization: Bearer ghp_xxx'
 ```
 
-Login happens once, before any content request, on the same session the crawl
-then uses. The authenticator:
+### Option 4 - bring your own session
+
+If you would rather not hand over a password, sign in with your browser and
+reuse those cookies:
+
+```bash
+python3 crawl.py https://intranet.example.com/dashboard \
+  --session-file intranet-session.json --require-login
+```
+
+### Session reuse
+
+The first login writes cookies to `output/session.json` (mode `0600`). Later runs
+with the same `--session-file` skip the login form entirely, so the credentials
+are only needed once. `--session-file` and a saved `output/session.json` are
+interchangeable.
+
+### Credential handling
+
+- the password is read from `--password-env` (default `SUPERCRAWLER_PASSWORD`),
+  so it stays out of shell history and process listings
+- `--password` exists for scripted use; an explicit inline value wins over the
+  env var, and the log says so when both are present
+- the password never appears in logs, reports, `decision` records, or `AuthError`
+  messages; log lines are redacted on the way out as a second line of defence
+- `session.json` is written with `0600` permissions and is gitignored
+- `--require-login` aborts rather than crawling anonymously if login fails
+
+### How login works
 
 - finds the login form by looking for a password field, scoring candidates so a
   search box is never mistaken for it
@@ -46,7 +111,6 @@ then uses. The authenticator:
   `authenticity_token`, and friends) are carried over
 - confirms the login actually worked by checking it is no longer on a login form
   and that no failure text came back, so it never proceeds silently as anonymous
-- accepts `--session-file` to save cookies and skip the form on later runs
 
 ### Two-factor
 
@@ -54,17 +118,6 @@ If the site asks for a code, the crawler stops and asks you for it rather than
 trying to get around it. With `--ask` it prompts; with `--auto` it reports
 `needs_totp` and continues without a session. A captcha page is detected and
 refused outright — it will not attempt to solve one.
-
-### Credential handling
-
-- the password is read from `--password-env` (default `SUPERCRAWLER_PASSWORD`),
-  so it stays out of shell history and process listings
-- `--password` exists but is discouraged; the two together are rejected as a
-  likely mistake
-- the password never appears in logs, reports, or `AuthError` messages; log lines
-  are redacted on the way out as a second line of defence
-- `session.json` is written with `0600` permissions and is gitignored
-- `--require-login` aborts rather than crawling anonymously if login fails
 
 ### What login does not do
 
@@ -143,6 +196,7 @@ If there is no sitemap it falls back to link discovery and says so.
 | link depth | `-1` unlimited, `0` seeds only |
 | speed | polite / balanced / fast, then delay and concurrency |
 | extras | robots.txt, sitemap use, dedupe, raw HTML saving, external links |
+| access | no login, login form, saved session, or auth header |
 
 Every answer has a default, so pressing Enter accepts it. It prints the finished
 plan and asks for confirmation before touching the network.
@@ -263,7 +317,7 @@ On by default, and worth keeping on:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 130 tests, local fixture server
+python3 -m unittest discover -s tests -v   # 141 tests, local fixture server
 python3 tests/smoke_cli.py                 # end-to-end CLI check
 ```
 

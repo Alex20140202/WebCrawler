@@ -432,5 +432,93 @@ class WizardTests(unittest.TestCase):
                 self.assertIsInstance(goal["include"], str)
 
 
+class WizardAuthTests(unittest.TestCase):
+    BASE_STEPS = [
+        "x.test",     # site
+        "1",          # whole site
+        "1",          # content goal
+        "1",          # unlimited budget
+        "12", "0",    # depth, max pages
+        "2",          # balanced
+        "0.5", "8", "2",
+        "",           # user agent
+        "", "", "", "", "",  # robots, sitemap, dedupe, save html, external
+        "out",        # output dir
+        "",           # excludes
+    ]
+
+    def _scripted(self, answers):
+        queue = list(answers)
+
+        def prompter(prompt):
+            return queue.pop(0) if queue else ""
+
+        return prompter
+
+    def test_no_login_is_the_default(self):
+        built = build_plan(prompter=self._scripted(self.BASE_STEPS + ["1"]))
+        self.assertEqual(built["config"].login_url, "")
+        self.assertFalse(built["config"].has_login)
+
+    def test_login_form_with_env_password(self):
+        steps = self.BASE_STEPS + [
+            "2",                      # sign in with a login form
+            "https://x.test/login",   # login page
+            "alice",                  # username
+            "MY_PW",                  # env var name
+            "y",                      # already exported
+            "y",                      # abort if login fails
+        ]
+        built = build_plan(prompter=self._scripted(steps))
+        config = built["config"]
+        self.assertEqual(config.login_url, "https://x.test/login")
+        self.assertEqual(config.login_username, "alice")
+        self.assertEqual(config.login_password_env, "MY_PW")
+        self.assertEqual(config.login_password, "", "nothing should be stored")
+        self.assertTrue(config.require_login)
+        self.assertTrue(config.session_file.endswith("session.json"))
+
+    def test_login_form_with_typed_password(self):
+        steps = self.BASE_STEPS + [
+            "2", "https://x.test/login", "alice", "MY_PW",
+            "n",       # not exported, so prompt for it
+            "s3cret",  # typed
+            "y",
+        ]
+        built = build_plan(prompter=self._scripted(steps))
+        self.assertEqual(built["config"].login_password, "s3cret")
+        self.assertNotIn("s3cret", str(built["plan"]), "plan must not echo it")
+
+    def test_bare_login_url_gets_https(self):
+        steps = self.BASE_STEPS + ["2", "x.test/login", "bob", "PW", "y", "y"]
+        built = build_plan(prompter=self._scripted(steps))
+        self.assertEqual(built["config"].login_url, "https://x.test/login")
+
+    def test_login_url_can_be_declined(self):
+        built = build_plan(prompter=self._scripted(self.BASE_STEPS + ["2", ""]))
+        self.assertEqual(built["config"].login_url, "")
+
+    def test_reuse_saved_session(self):
+        steps = self.BASE_STEPS + ["3", "", "y"]
+        built = build_plan(prompter=self._scripted(steps))
+        self.assertTrue(built["config"].session_file)
+        self.assertEqual(built["config"].login_url, "")
+
+    def test_auth_header_mode(self):
+        steps = self.BASE_STEPS + ["4", "Authorization: Bearer abc"]
+        built = build_plan(prompter=self._scripted(steps))
+        self.assertEqual(built["config"].auth_header, "Authorization: Bearer abc")
+
+    def test_empty_auth_header_falls_back_to_nothing(self):
+        built = build_plan(prompter=self._scripted(self.BASE_STEPS + ["4", ""]))
+        self.assertEqual(built["config"].auth_header, "")
+
+    def test_typed_password_is_not_written_to_the_plan_summary(self):
+        steps = self.BASE_STEPS + [
+            "2", "https://x.test/login", "alice", "PW", "n", "topsecret", "y"]
+        built = build_plan(prompter=self._scripted(steps))
+        self.assertNotIn("topsecret", json.dumps(built["plan"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
