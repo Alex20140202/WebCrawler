@@ -1,4 +1,5 @@
 from .config import PRESETS, CrawlConfig, get_preset
+from .agent import ACTION_FEED, ACTION_LOGIN, ACTION_NEXT, ACTION_PAGINATE, Agent
 from .crawler import Crawler, crawl
 from .discovery import (
     SiteProbe,
@@ -22,11 +23,13 @@ from .parser import (
     same_site,
     word_frequencies,
 )
+from .interact import Interactor
 from .report import write_csv, write_html, write_json, write_jsonl, write_reports
+from .scanner import Finding, PageSignals, build_paged_urls, expand_search_form, scan_page
 from .state import CrawlState, load_state, save_state
 from .wizard import build_plan
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 __all__ = [
     "CrawlConfig",
@@ -45,6 +48,17 @@ __all__ = [
     "strip_tracking_params",
     "looks_js_rendered",
     "build_plan",
+    "Agent",
+    "ACTION_PAGINATE",
+    "ACTION_NEXT",
+    "ACTION_FEED",
+    "ACTION_LOGIN",
+    "Interactor",
+    "scan_page",
+    "PageSignals",
+    "Finding",
+    "build_paged_urls",
+    "expand_search_form",
     "CrawlState",
     "save_state",
     "load_state",

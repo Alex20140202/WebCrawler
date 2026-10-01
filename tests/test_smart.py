@@ -76,6 +76,11 @@ class UrlPolicyTests(unittest.TestCase):
                     "https://x.test/docs/index.html"):
             self.assertTrue(is_crawlable_url(url), url)
 
+    def test_search_paths_blocked_by_default_but_allowable_on_request(self):
+        self.assertFalse(is_crawlable_url("https://x.test/search?q=a"))
+        self.assertTrue(is_crawlable_url("https://x.test/search?q=a",
+                                         allow_search=True))
+
     def test_pagination_detection(self):
         self.assertIsNotNone(pagination_key("https://x.test/blog?page=3"))
         self.assertIsNotNone(pagination_key("https://x.test/blog/page/4"))

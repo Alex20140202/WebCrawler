@@ -90,6 +90,32 @@ ORPHAN = """<html><head><title>Orphan</title></head><body>
 <h1>Orphan</h1><p>Only reachable via sitemap, never linked from anywhere on the site.</p>
 </body></html>"""
 
+BLOG = """<html><head><title>Blog</title>
+<link rel="alternate" type="application/rss+xml" href="/feed.xml"></head>
+<body><h1>Blog</h1>
+<div class="pagination">
+  <a href="/blog.html">1</a><a href="/blog.html?page=2">2</a>
+</div>
+<a href="/blog.html?page=2">Next</a>
+</body></html>"""
+
+BLOG_PAGE = """<html><head><title>Blog page %s</title></head><body>
+<h1>Post %s</h1><p>Distinct paginated article body number %s with enough words to
+avoid being collapsed as a duplicate of another page in this fixture set.</p>
+<a href="/blog.html">back</a></body></html>"""
+
+MEMBERS = """<html><head><title>Members</title></head><body>
+<h1>Members</h1>
+<form action="/login" method="post">
+<input type="text" name="user"><input type="password" name="pass">
+<input type="submit" value="Sign in"></form>
+<p>Please sign in to see this.</p>
+<a href="/members-secret.html">Secret area</a></body></html>"""
+
+MEMBERS_SECRET = """<html><head><title>Secret</title></head><body>
+<h1>Secret</h1><p>Only reachable by following a link out of the login wall.</p>
+</body></html>"""
+
 SPA_PAGE = """<html><head><title>SPA shell</title></head><body>
 <div id="root"></div>
 <script src="/app.js"></script><script src="/vendor.js"></script>
@@ -122,6 +148,18 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, SITEMAP_PAGES.format(base=base), "application/xml")
         elif path == "/orphan.html":
             self._respond(200, ORPHAN)
+        elif path == "/blog.html":
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            if "page=" in query:
+                number = query.split("page=")[-1].split("&")[0]
+                number = "".join(ch for ch in number if ch.isdigit()) or "2"
+                self._respond(200, BLOG_PAGE % (number, number, number))
+            else:
+                self._respond(200, BLOG)
+        elif path == "/members.html":
+            self._respond(200, MEMBERS)
+        elif path == "/members-secret.html":
+            self._respond(200, MEMBERS_SECRET)
         elif path == "/spa.html":
             self._respond(200, SPA_PAGE)
         elif path in ("/", "/index.html"):

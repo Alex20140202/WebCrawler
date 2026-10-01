@@ -40,6 +40,12 @@ class CrawlConfig:
     min_delay_on_errors: float = 5.0
     auto_tune: bool = True
 
+    auto_actions: bool = True
+    interaction_mode: str = "auto"
+    max_questions: int = 10
+    max_actions_per_page: int = 25
+    decisions_file: str = ""
+
     def merged(self, **overrides) -> "CrawlConfig":
         applied = {k: v for k, v in overrides.items() if v is not None}
         unknown = set(applied) - {f.name for f in self.__dataclass_fields__.values()}
@@ -51,6 +57,17 @@ class CrawlConfig:
     def unlimited(self) -> bool:
         """True when the page budget is uncapped."""
         return self.max_pages <= 0
+
+    def validate(self) -> None:
+        if self.interaction_mode not in ("ask", "auto", "never"):
+            raise ValueError(
+                "interaction_mode must be ask, auto or never, got %r"
+                % self.interaction_mode
+            )
+        if self.max_questions < 0:
+            raise ValueError("max_questions cannot be negative")
+        if self.max_actions_per_page < 0:
+            raise ValueError("max_actions_per_page cannot be negative")
 
     @property
     def unlimited_depth(self) -> bool:

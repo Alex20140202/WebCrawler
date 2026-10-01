@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv-out", help="custom path for the CSV report")
     parser.add_argument("--no-reports", action="store_true", help="do not write report files")
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
+    parser.set_defaults(interaction_mode=None)
 
     smart = parser.add_argument_group("smart whole-site mode")
     smart.add_argument("--smart", action="store_true",
@@ -71,6 +72,25 @@ def build_parser() -> argparse.ArgumentParser:
     smart.add_argument("--max-sitemaps", type=int, help="how many sitemap files to read")
     smart.add_argument("--no-resume", action="store_true",
                        help="start fresh even if the state file exists")
+
+    agent_group = parser.add_argument_group("mid-crawl decisions")
+    agent_group.add_argument("--ask", dest="interaction_mode",
+                             action="store_const", const="ask",
+                             help="ask me when the crawler hits an ambiguous choice")
+    agent_group.add_argument("--auto", dest="interaction_mode",
+                             action="store_const", const="auto",
+                             help="act on safe defaults without asking")
+    agent_group.add_argument("--never-ask", dest="interaction_mode",
+                             action="store_const", const="never",
+                             help="never prompt, never auto-expand")
+    agent_group.add_argument("--max-questions", type=int,
+                             help="how many questions to ask in one run")
+    agent_group.add_argument("--no-auto-actions", action="store_true",
+                             help="do not act on pagination, feeds or search forms")
+    agent_group.add_argument("--max-actions-per-page", type=int,
+                             help="cap URLs added per page by the agent")
+    agent_group.add_argument("--decisions-file",
+                             help="save/load answered decisions (JSON)")
     return parser
 
 
@@ -105,7 +125,16 @@ def config_from_args(args: argparse.Namespace):
         state_file="" if (args.no_resume or args.wizard) else (
             args.state_file or _default_state_file(args.output)),
         max_sitemaps=args.max_sitemaps,
+        interaction_mode=args.interaction_mode,
+        max_questions=args.max_questions,
+        auto_actions=False if args.no_auto_actions else None,
+        max_actions_per_page=args.max_actions_per_page,
+        decisions_file=args.decisions_file or _default_decisions_file(args.output),
     )
+
+
+def _default_decisions_file(output_dir: str) -> str:
+    return os.path.join(output_dir, "decisions.json")
 
 
 def _default_state_file(output_dir: str) -> str:
@@ -143,6 +172,21 @@ def print_summary(result: dict) -> None:
     site = summary.get("site") or {}
     if site.get("sitemap_sources"):
         lines.append("  sitemaps        : %s" % ", ".join(site["sitemap_sources"][:3]))
+
+    agent_info = summary.get("agent") or {}
+    if agent_info.get("actions_total"):
+        lines.append("  agent actions   : %d (%s)"
+                     % (agent_info["actions_total"],
+                        ", ".join("%s=%d" % kv for kv in
+                                  sorted(agent_info["actions_by_kind"].items()))))
+    interactions = agent_info.get("interactions") or {}
+    if interactions:
+        lines.append("  interactions    : mode=%s asked=%d skipped=%d"
+                     % (interactions.get("mode"), interactions.get("questions_asked", 0),
+                        interactions.get("questions_skipped", 0)))
+    if summary.get("login_walls"):
+        lines.append("  login-walled    : %d page(s) skipped"
+                     % len(summary["login_walls"]))
     problems = [p for p in result["pages"] if p.get("error")][:10]
     if problems:
         lines.append("")

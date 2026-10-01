@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -84,6 +85,38 @@ assert os.path.exists(state), "state file missing"
 print("\n### resume with --no-resume discards state")
 code = main([base + "/", "--smart", "--max-pages", "3", "-o", out5, "--no-resume"])
 assert code == 0
+
+print("\n### agent auto mode finds paginated pages on its own")
+out6 = out + "_agent"
+shutil.rmtree(out6, ignore_errors=True)
+code = main([base + "/blog.html", "--auto", "--no-sitemap", "-o", out6])
+assert code == 0, "agent crawl failed"
+with open(os.path.join(out6, "report.json"), encoding="utf-8") as handle:
+    payload = json.load(handle)
+agent_summary = payload["summary"]["agent"]
+print("  actions: %d" % agent_summary["actions_total"])
+print("  by kind: %s" % agent_summary["actions_by_kind"])
+print("  interaction mode: %s" % agent_summary["interactions"]["mode"])
+paged = [p["url"] for p in payload["pages"] if "page=" in p["url"]]
+print("  paginated urls reached: %d" % len(paged))
+assert len(paged) > 0, "agent should have expanded pagination"
+
+print("\n### agent disabled crawls fewer pages")
+out7 = out + "_agentoff"
+shutil.rmtree(out7, ignore_errors=True)
+code = main([base + "/blog.html", "--no-sitemap", "--no-auto-actions", "-o", out7])
+assert code == 0
+with open(os.path.join(out7, "report.json"), encoding="utf-8") as handle:
+    off_payload = json.load(handle)
+print("  with agent: %d page(s), without: %d"
+      % (payload["summary"]["pages_crawled"],
+         off_payload["summary"]["pages_crawled"]))
+assert off_payload["summary"]["agent"]["actions_total"] == 0
+
+print("\n### decisions file records agent choices")
+decisions = os.path.join(out6, "decisions.json")
+print("  decisions file: %s" % os.path.exists(decisions))
+assert os.path.exists(decisions)
 
 print("\n### negative page budget rejected")
 code = main([base + "/", "--max-pages", "-5"])

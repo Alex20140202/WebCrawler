@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from .config import CrawlConfig
+from .agent import Agent
 from .discovery import (
     estimate_from_links,
     is_crawlable_url,
@@ -20,6 +21,7 @@ from .discovery import (
     strip_tracking_params,
 )
 from .fetcher import Fetcher
+from .interact import Interactor
 from .parser import (
     extract_emails,
     extract_links,
@@ -28,6 +30,7 @@ from .parser import (
     registrable_domain,
     word_frequencies,
 )
+from .scanner import scan_page
 from .state import CrawlState, load_state, save_state
 
 Logger = Optional[Callable[[str], None]]
@@ -36,8 +39,10 @@ Logger = Optional[Callable[[str], None]]
 class Crawler:
     """Breadth-first, rate-limited, robots-aware web crawler."""
 
-    def __init__(self, config: CrawlConfig, logger: Logger = None):
+    def __init__(self, config: CrawlConfig, logger: Logger = None,
+                 interactor: Optional[Interactor] = None):
         self.config = config
+        self.config.validate()
         self.logger = logger
         self._seen = set()
         self._lock = threading.Lock()
@@ -49,6 +54,15 @@ class Crawler:
         self.total_known = 0
         self._sitemap_urls: Set[str] = set()
         self._js_heavy_pages = 0
+        self.interactor = interactor or Interactor(
+            mode=config.interaction_mode,
+            max_questions=config.max_questions,
+            logger=logger,
+        )
+        self.agent = Agent(
+            config, interactor=self.interactor, logger=logger,
+            in_scope=self._in_scope,
+        )
 
     def _log(self, message: str) -> None:
         if self.logger and self.config.verbose:
@@ -141,6 +155,8 @@ class Crawler:
         if self.config.state_file:
             # Saved again so the coverage set written during finalize persists.
             save_state(self.config.state_file, self._state)
+        if self.config.decisions_file:
+            self.interactor.save(self.config.decisions_file)
         return result
 
     def _resume_if_possible(self) -> bool:
@@ -383,6 +399,21 @@ class Crawler:
             else links["internal"] + links["external"]
         children = self._filter_children(children)
 
+        signals = scan_page(
+            html_text, result.url,
+            word_count=record.get("word_count", 0),
+            link_count=record.get("internal_links_count", 0),
+        )
+        record["findings"] = [f.as_dict() for f in signals.findings()]
+        record["needs_login"] = signals.needs_login
+        if signals.needs_login:
+            children = []
+
+        extra = self.agent.consider(result.url, signals, depth)
+        if extra:
+            known = set(children)
+            children.extend(u for u in extra if u not in known)
+
         if looks_js_rendered(html_text, record.get("internal_links_count", 0),
                              record.get("word_count", 0)):
             record["js_rendered"] = True
@@ -500,6 +531,8 @@ class Crawler:
             "all_emails": all_emails,
             "pending": len(self._state.pending),
             "coverage": coverage,
+            "agent": self.agent.summary(),
+            "login_walls": sorted({p["url"] for p in pages if p.get("needs_login")}),
             "site": self.probe.as_dict() if self.probe else None,
             "config": {
                 "max_depth": self.config.max_depth,

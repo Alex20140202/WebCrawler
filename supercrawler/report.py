@@ -10,7 +10,8 @@ CSV_COLUMNS = [
     "url", "depth", "status", "content_type", "title", "title_length",
     "meta_description", "lang", "word_count", "h1_count", "image_count",
     "images_missing_alt", "internal_links", "external_links", "emails",
-    "has_viewport", "has_og", "has_twitter_card", "fetch_ms", "error",
+    "has_viewport", "has_og", "has_twitter_card", "needs_login", "findings",
+    "fetch_ms", "error",
 ]
 
 
@@ -55,6 +56,9 @@ def _flat_row(page: Dict) -> Dict:
         "has_viewport": page.get("has_viewport", False),
         "has_og": page.get("has_og", False),
         "has_twitter_card": page.get("has_twitter_card", False),
+        "needs_login": page.get("needs_login", False),
+        "findings": ";".join(sorted({f.get("kind", "") for f
+                                     in (page.get("findings") or [])})),
         "fetch_ms": round((page.get("fetch_ms") or 0.0), 1),
         "error": page.get("error") or "",
     }
@@ -176,6 +180,38 @@ def write_html(path: str, pages: Sequence[Dict], summary: Optional[Dict] = None)
         '<a href="mailto:%s">%s</a>' % (esc(e), esc(e)) for e in emails[:200]
     ) or '<p class="muted">None found.</p>'
 
+    agent_info = summary.get("agent") or {}
+    actions = agent_info.get("actions_by_kind") or {}
+    interaction = agent_info.get("interactions") or {}
+    agent_html = ""
+    if actions or interaction:
+        rows_actions = "".join(
+            '<div class="row"><span class="dom">%s</span>'
+            '<span class="bar">%s</span><span class="num">%d</span></div>'
+            % (esc(kind.replace("_", " ")), _bar(count, max(actions.values())), count)
+            for kind, count in sorted(actions.items(), key=lambda kv: -kv[1])
+        ) or '<p class="muted">The crawler took no extra actions.</p>'
+        agent_html = (
+            '<h2>Crawler actions</h2><div class="panel">%s'
+            '<p class="muted">mode: %s · questions asked: %d · skipped: %d'
+            ' · topics: %s</p></div>'
+            % (rows_actions, esc(interaction.get("mode", "?")),
+               interaction.get("questions_asked", 0),
+               interaction.get("questions_skipped", 0),
+               esc(", ".join(agent_info.get("topics_consulted", [])) or "none"))
+        )
+
+    walls = summary.get("login_walls") or []
+    wall_html = ""
+    if walls:
+        wall_html = (
+            '<h2>Pages needing a login (%d)</h2><div class="panel">'
+            '<p class="muted">Not fetched. This crawler does not sign in.</p>%s</div>'
+            % (len(walls), "".join(
+                '<div><a href="%s" target="_blank" rel="noopener noreferrer">%s</a></div>'
+                % (esc(w), esc(w)) for w in walls[:50]))
+        )
+
     document = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Crawl report</title>
@@ -216,6 +252,7 @@ a:hover { text-decoration:underline; }
 <h2>Top hosts</h2><div class="panel">%(domains)s</div>
 <h2>Pages by depth</h2><div class="panel">%(depths)s</div>
 <h2>Emails (%(email_count)d)</h2><div class="panel emailbox">%(emails)s</div>
+%(agent)s%(walls)s
 <h2>Pages (%(page_count)d)</h2>
 <table><thead><tr><th>URL</th><th>Depth</th><th>Status</th><th>Title</th>
 <th>Words</th><th>Meta</th><th>Links</th></tr></thead><tbody>%(rows)s</tbody></table>
@@ -229,6 +266,8 @@ a:hover { text-decoration:underline; }
         "domains": domain_html,
         "depths": depth_html,
         "emails": email_html,
+        "agent": agent_html,
+        "walls": wall_html,
         "email_count": len(emails),
         "page_count": len(pages),
         "rows": rows_html,

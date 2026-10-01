@@ -141,12 +141,21 @@ def candidate_sitemaps(base_url: str, robots_text: str = "") -> List[str]:
     return ordered
 
 
-def is_crawlable_url(url: str) -> bool:
+def is_crawlable_url(url: str, allow_search: bool = False) -> bool:
+    """Whether a discovered URL is worth fetching.
+
+    `allow_search` relaxes the /search rule. Link-following keeps it on so a
+    site's own search results cannot trap the crawl in a loop, while the agent
+    may still deliberately request a search URL it reasoned about.
+    """
     parts = urlsplit(url)
     path = (parts.path or "/").lower()
     if path.endswith(NON_PAGE_SUFFIXES):
         return False
-    if any(path.startswith(prefix) for prefix in SKIP_PATH_PREFIXES):
+    prefixes = SKIP_PATH_PREFIXES
+    if allow_search:
+        prefixes = tuple(p for p in SKIP_PATH_PREFIXES if p != "/search")
+    if any(path.startswith(prefix) for prefix in prefixes):
         return False
     return True
 
