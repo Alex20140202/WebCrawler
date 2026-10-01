@@ -65,6 +65,40 @@ try:
 except SystemExit as exc:
     print("  SystemExit code %s" % exc.code)
 
+print("\n### --smart --plan-only")
+out4 = out + "_plan"
+shutil.rmtree(out4, ignore_errors=True)
+code = main([base + "/", "--smart", "--plan-only", "-o", out4])
+assert code == 0, "plan-only failed with %s" % code
+assert not os.path.exists(os.path.join(out4, "report.json")), "plan-only must not crawl"
+
+print("\n### --smart whole-site crawl with resume state")
+out5 = out + "_smart"
+shutil.rmtree(out5, ignore_errors=True)
+code = main([base + "/", "--smart", "--max-pages", "4", "-o", out5])
+assert code == 0
+state = os.path.join(out5, "crawl-state.json")
+print("  state file written: %s" % os.path.exists(state))
+assert os.path.exists(state), "state file missing"
+
+print("\n### resume with --no-resume discards state")
+code = main([base + "/", "--smart", "--max-pages", "3", "-o", out5, "--no-resume"])
+assert code == 0
+
+print("\n### negative page budget rejected")
+code = main([base + "/", "--max-pages", "-5"])
+print("  exit code (expected 2): %d" % code)
+assert code == 2
+
+print("\n### no seeds rejected")
+try:
+    code = main(["--smart"])
+    print("  main() returned %d (expected 2)" % code)
+    assert code == 2
+except SystemExit as exc:
+    print("  argparse SystemExit code %s (expected 2)" % exc.code)
+    assert exc.code == 2
+
 server.shutdown()
 server.server_close()
 

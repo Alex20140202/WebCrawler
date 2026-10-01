@@ -1,5 +1,17 @@
 from .config import PRESETS, CrawlConfig, get_preset
 from .crawler import Crawler, crawl
+from .discovery import (
+    SiteProbe,
+    candidate_sitemaps,
+    estimate_from_links,
+    is_crawlable_url,
+    looks_js_rendered,
+    pagination_key,
+    parse_sitemap,
+    probe_site,
+    recommend_presets,
+    strip_tracking_params,
+)
 from .fetcher import Fetcher, Throttle
 from .parser import (
     extract_emails,
@@ -11,8 +23,10 @@ from .parser import (
     word_frequencies,
 )
 from .report import write_csv, write_html, write_json, write_jsonl, write_reports
+from .state import CrawlState, load_state, save_state
+from .wizard import build_plan
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "CrawlConfig",
@@ -20,6 +34,20 @@ __all__ = [
     "get_preset",
     "Crawler",
     "crawl",
+    "probe_site",
+    "SiteProbe",
+    "parse_sitemap",
+    "candidate_sitemaps",
+    "estimate_from_links",
+    "recommend_presets",
+    "is_crawlable_url",
+    "pagination_key",
+    "strip_tracking_params",
+    "looks_js_rendered",
+    "build_plan",
+    "CrawlState",
+    "save_state",
+    "load_state",
     "Fetcher",
     "Throttle",
     "normalize_url",

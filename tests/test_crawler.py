@@ -65,7 +65,36 @@ NOTFOUND = "<html><body>gone</body></html>"
 ROBOTS = """User-agent: *
 Disallow: /private.html
 Crawl-delay: 0
+Sitemap: %s/sitemap.xml
 """
+
+SITEMAP_INDEX = """<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>{base}/sitemap-pages.xml</loc></sitemap>
+</sitemapindex>
+"""
+
+SITEMAP_PAGES = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>{base}/about.html</loc><lastmod>2024-01-02</lastmod></url>
+  <url><loc>{base}/deep/page.html</loc></url>
+  <url><loc>{base}/dup.html</loc></url>
+  <url><loc>{base}/orphan.html</loc></url>
+  <url><loc>{base}/notes.txt</loc></url>
+  <url><loc>{base}/private.html</loc></url>
+  <url><loc>http://external.test/offsite</loc></url>
+</urlset>
+"""
+
+ORPHAN = """<html><head><title>Orphan</title></head><body>
+<h1>Orphan</h1><p>Only reachable via sitemap, never linked from anywhere on the site.</p>
+</body></html>"""
+
+SPA_PAGE = """<html><head><title>SPA shell</title></head><body>
+<div id="root"></div>
+<script src="/app.js"></script><script src="/vendor.js"></script>
+<script>window.__DATA__={}</script>
+</body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -84,8 +113,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        base = "http://127.0.0.1:%d" % self.port
         if path == "/robots.txt":
-            self._respond(200, ROBOTS, "text/plain")
+            self._respond(200, ROBOTS % base, "text/plain")
+        elif path == "/sitemap.xml":
+            self._respond(200, SITEMAP_INDEX.format(base=base), "application/xml")
+        elif path == "/sitemap-pages.xml":
+            self._respond(200, SITEMAP_PAGES.format(base=base), "application/xml")
+        elif path == "/orphan.html":
+            self._respond(200, ORPHAN)
+        elif path == "/spa.html":
+            self._respond(200, SPA_PAGE)
         elif path in ("/", "/index.html"):
             self._respond(200, INDEX % {"port": self.port})
         elif path == "/about.html":
@@ -164,6 +202,7 @@ class CrawlTests(unittest.TestCase):
                 delay=0.0,
                 concurrency=4,
                 per_host_concurrency=4,
+                use_sitemap=False,
             )
             result = crawl(config, logger=None)
 
@@ -212,7 +251,8 @@ class CrawlTests(unittest.TestCase):
 
     def test_404_recorded_without_children(self):
         with LocalSite() as site:
-            config = CrawlConfig(seeds=[site.base + "/missing.html"], delay=0.0)
+            config = CrawlConfig(seeds=[site.base + "/missing.html"], delay=0.0,
+                                use_sitemap=False)
             result = crawl(config, logger=None)
         page = result["pages"][0]
         self.assertEqual(page["status"], 404)
@@ -221,7 +261,8 @@ class CrawlTests(unittest.TestCase):
 
     def test_non_html_is_recorded_but_not_parsed(self):
         with LocalSite() as site:
-            config = CrawlConfig(seeds=[site.base + "/notes.txt"], delay=0.0)
+            config = CrawlConfig(seeds=[site.base + "/notes.txt"], delay=0.0,
+                                use_sitemap=False)
             result = crawl(config, logger=None)
         page = result["pages"][0]
         self.assertEqual(page["content_type"], "text/plain")
@@ -291,7 +332,7 @@ class CrawlTests(unittest.TestCase):
         with LocalSite() as site, tempfile.TemporaryDirectory() as tmp:
             config = CrawlConfig(
                 seeds=[site.base + "/about.html"], delay=0.0,
-                save_html=True, output_dir=tmp,
+                save_html=True, output_dir=tmp, use_sitemap=False,
             )
             result = crawl(config, logger=None)
             saved = result["pages"][0]["saved_html"]

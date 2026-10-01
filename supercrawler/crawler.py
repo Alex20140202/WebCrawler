@@ -5,13 +5,20 @@ import os
 import re
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from .config import CrawlConfig
+from .discovery import (
+    estimate_from_links,
+    is_crawlable_url,
+    looks_js_rendered,
+    probe_site,
+    recommend_presets,
+    strip_tracking_params,
+)
 from .fetcher import Fetcher
 from .parser import (
     extract_emails,
@@ -21,6 +28,7 @@ from .parser import (
     registrable_domain,
     word_frequencies,
 )
+from .state import CrawlState, load_state, save_state
 
 Logger = Optional[Callable[[str], None]]
 
@@ -34,11 +42,49 @@ class Crawler:
         self._seen = set()
         self._lock = threading.Lock()
         self._pages: List[Dict] = []
-        self._counts = {"skipped": 0, "robots_blocked": 0, "errors": 0}
+        self._counts = {"skipped": 0, "robots_blocked": 0, "errors": 0, "duplicates": 0}
+        self._content_hashes: Dict[str, str] = {}
+        self._state = CrawlState()
+        self.probe = None
+        self.total_known = 0
+        self._sitemap_urls: Set[str] = set()
+        self._js_heavy_pages = 0
 
     def _log(self, message: str) -> None:
         if self.logger and self.config.verbose:
             self.logger(message)
+
+    def plan(self) -> Dict:
+        """Probe the target and return a crawl plan without fetching pages."""
+        base = self._seed_url(self.config.seeds[0]) if self.config.seeds else None
+        if not base:
+            raise ValueError("no valid seed URL")
+
+        def fetch_text(url: str) -> Optional[str]:
+            with Fetcher(self.config) as fetcher:
+                result = fetcher.get(url)
+            return result.text if result and result.ok else None
+
+        self._log("probing %s for sitemaps..." % base)
+        probe = probe_site(
+            fetch_text, base,
+            max_sitemaps=self.config.max_sitemaps,
+            max_entries=self.config.max_sitemap_entries,
+            logger=self._log,
+        )
+        self.probe = probe
+
+        urls = probe.urls(limit=self.config.max_pages if self.config.max_pages > 0 else None)
+        estimate = estimate_from_links(urls)
+        recommended = recommend_presets(estimate)
+
+        return {
+            "probe": probe.as_dict(),
+            "sample_urls": urls[:25],
+            "estimate": estimate,
+            "recommended": recommended,
+            "notes": list(probe.notes),
+        }
 
     def run(self) -> Dict:
         started = time.monotonic()
@@ -49,48 +95,131 @@ class Crawler:
             raise ValueError("no valid seed URLs (need http/https URLs)")
 
         self._log("seeds: %s" % ", ".join(u for u, _ in seeds))
-        self._log("max_depth=%d max_pages=%d concurrency=%d delay=%.2fs robots=%s"
-                  % (self.config.max_depth, self.config.max_pages,
+        self._log("scope: max_depth=%s max_pages=%s concurrency=%d delay=%.2fs robots=%s sitemap=%s"
+                  % ("unlimited" if self.config.unlimited_depth else self.config.max_depth,
+                     "unlimited" if self.config.unlimited else self.config.max_pages,
                      self.config.concurrency, self.config.delay,
-                     "on" if self.config.respect_robots else "off"))
+                     "on" if self.config.respect_robots else "off",
+                     "on" if self.config.use_sitemap else "off"))
+
+        resumed = self._resume_if_possible()
+        if not resumed:
+            self._state.signature = self._signature()
 
         with Fetcher(self.config) as fetcher:
-            frontier = deque(seeds)
-            while frontier and len(self._pages) < self.config.max_pages:
-                batch = self._take_batch(frontier)
+            if self.config.use_sitemap:
+                self._seed_from_sitemap(fetcher, seeds)
+
+            while self._state.pending and not self._budget_exhausted():
+                batch = self._take_batch()
                 if not batch:
                     break
                 batch_depth = batch[0][1]
 
                 self._log("depth %d: fetching %d url(s), %d queued"
-                          % (batch_depth, len(batch), len(frontier)))
+                          % (batch_depth, len(batch), len(self._state.pending)))
 
                 for record, children in self._fetch_batch(fetcher, batch):
                     self._pages.append(record)
+                    self._state.pages_crawled += 1
                     for child in children:
-                        with self._lock:
-                            if child in self._seen:
-                                continue
-                            self._seen.add(child)
-                        frontier.append((child, batch_depth + 1))
+                        if child in self._seen:
+                            continue
+                        self._state.push(child, batch_depth + 1)
                         self._log("  + %s (depth %d)" % (child, batch_depth + 1))
 
-        elapsed = time.monotonic() - started
-        return self._finalize(elapsed=elapsed, started_at=started_at, seeds=seeds)
+                if self.config.state_file:
+                    save_state(self.config.state_file, self._state)
 
-    def _take_batch(self, frontier: "deque") -> List[Tuple[str, int]]:
-        remaining = self.config.max_pages - len(self._pages)
-        size = min(self.config.concurrency, max(remaining, 0))
+                if self._should_stop_for_errors():
+                    self._log("stopping: too many consecutive failures")
+                    break
+
+        elapsed = time.monotonic() - started
+        result = self._finalize(elapsed=elapsed, started_at=started_at, seeds=seeds,
+                                resumed=resumed)
+        if self.config.state_file:
+            # Saved again so the coverage set written during finalize persists.
+            save_state(self.config.state_file, self._state)
+        return result
+
+    def _resume_if_possible(self) -> bool:
+        if not self.config.state_file:
+            return False
+        loaded = load_state(self.config.state_file)
+        if loaded is None:
+            return False
+        if loaded.signature and loaded.signature != self._signature():
+            self._log("state file targets a different site, starting fresh")
+            return False
+        self._state = loaded
+        self._state.signature = self._signature()
+        self._seen = set(loaded.seen)
+        self._log("resuming: %d url(s) already seen, %d pending, %d page(s) done"
+                  % (len(loaded.seen), len(loaded.pending), loaded.pages_crawled))
+        return True
+
+    def _signature(self) -> str:
+        """Identity of this crawl target, used to validate a resumed state file."""
+        hosts = sorted({u for u in map(self._seed_url, self.config.seeds) if u})
+        return "|".join(hosts)
+
+    def _seed_from_sitemap(self, fetcher: Fetcher, seeds) -> None:
+        base = self._seed_url(seeds[0][0]) if seeds else None
+        if not base:
+            return
+
+        def fetch_text(url: str) -> Optional[str]:
+            result = fetcher.get(url)
+            return result.text if result.ok else None
+
+        probe = probe_site(
+            fetch_text, base,
+            max_sitemaps=self.config.max_sitemaps,
+            max_entries=self.config.max_sitemap_entries,
+            logger=self._log,
+        )
+        self.probe = probe
+        urls = probe.urls(
+            limit=self.config.max_pages if self.config.max_pages > 0 else None
+        )
+        self.total_known = len(urls)
+        self._sitemap_urls = set(urls)
+        self._log("sitemap: %d url(s) from %d map(s)"
+                  % (len(urls), len(probe.sitemap_sources)))
+
+        added = 0
+        for url in urls:
+            if self._in_scope(url):
+                self._state.push(url, 1)
+                added += 1
+        if added:
+            self._log("queued %d sitemap url(s) at depth 1" % added)
+
+    def _budget_exhausted(self) -> bool:
+        if self.config.unlimited:
+            return False
+        return len(self._pages) >= self.config.max_pages
+
+    def _take_batch(self) -> List[Tuple[str, int]]:
+        remaining = -1
+        if not self.config.unlimited:
+            remaining = max(self.config.max_pages - len(self._pages), 0)
+        size = self.config.concurrency if remaining < 0 \
+            else min(self.config.concurrency, remaining)
         if size <= 0:
             return []
-        batch = []
-        while frontier and len(batch) < size:
-            url, depth = frontier.popleft()
-            if depth > self.config.max_depth:
-                self._counts["skipped"] += 1
-                continue
-            batch.append((url, depth))
-        return batch
+        max_depth = -1 if self.config.unlimited_depth else self.config.max_depth
+        return self._state.pop_batch(size, max_depth)
+
+    def _should_stop_for_errors(self) -> bool:
+        if self.config.stop_on_error_ratio <= 0 or self.config.stop_on_error_ratio > 1:
+            return False
+        recent = self._pages[-50:]
+        if len(recent) < 20:
+            return False
+        failures = sum(1 for p in recent if p.get("error"))
+        return (failures / float(len(recent))) > self.config.stop_on_error_ratio
 
     @staticmethod
     def _seed_url(raw: str) -> Optional[str]:
@@ -121,6 +250,8 @@ class Crawler:
                     continue
                 self._seen.add(url)
             prepared.append((url, 0))
+        for url, depth in prepared:
+            self._state.push(url, depth)
         return prepared
 
     def _in_scope(self, url: str, is_seed: bool = False) -> bool:
@@ -172,6 +303,7 @@ class Crawler:
 
     def _fetch_batch(self, fetcher: Fetcher, batch: List[Tuple[str, int]]
                  ) -> List[Tuple[Dict, List[str]]]:
+        """Fetch a batch, dropping any URL blocked by robots.txt."""
         results: List[Tuple[Dict, List[str]]] = []
         workers = max(1, min(self.config.concurrency, len(batch)))
 
@@ -181,21 +313,24 @@ class Crawler:
             for future in as_completed(futures):
                 url = futures[future]
                 try:
-                    results.append(future.result())
+                    outcome = future.result()
                 except Exception as exc:  # keep one bad URL from killing the crawl
                     self._counts["errors"] += 1
                     self._log("  ! %s failed: %s: %s"
                               % (url, type(exc).__name__, exc))
-                    results.append((self._error_record(url, depth, exc), []))
+                    outcome = (self._error_record(url, depth, exc), [])
+                if outcome is not None:
+                    results.append(outcome)
         return results
 
-    def _fetch_one(self, fetcher: Fetcher, url: str, depth: int) -> Tuple[Dict, List[str]]:
+    def _fetch_one(self, fetcher: Fetcher, url: str, depth: int
+                   ) -> Optional[Tuple[Dict, List[str]]]:
         result = fetcher.get(url)
 
         if result.error == "blocked-by-robots":
             self._counts["robots_blocked"] += 1
             self._log("  - %s blocked by robots.txt" % url)
-            return self._error_record(url, depth, RuntimeError("blocked-by-robots")), []
+            return None
 
         if result.error and not result.status:
             self._counts["errors"] += 1
@@ -231,6 +366,12 @@ class Crawler:
             {"term": term, "count": count} for term, count in word_frequencies(html_text, 10)
         ]
 
+        if self.config.dedupe_content and self._is_duplicate(record):
+            self._counts["duplicates"] += 1
+            record["duplicate"] = True
+            self._log("  = %s (duplicate content)" % url)
+            return record, []
+
         links = extract_links(html_text, result.url, self.config.follow_nofollow)
         record["internal_links"] = links["internal"]
         record["external_links"] = links["external"]
@@ -240,7 +381,13 @@ class Crawler:
 
         children = links["internal"] if not self.config.follow_external \
             else links["internal"] + links["external"]
-        children = [c for c in children if c not in self._seen and self._in_scope(c)]
+        children = self._filter_children(children)
+
+        if looks_js_rendered(html_text, record.get("internal_links_count", 0),
+                             record.get("word_count", 0)):
+            record["js_rendered"] = True
+            self._js_heavy_pages += 1
+
         if result.truncated:
             record["truncated"] = True
         if self.config.save_html:
@@ -252,6 +399,32 @@ class Crawler:
                   % (url, record.get("word_count", 0),
                      len(links["internal"]), len(links["external"])))
         return record, children
+
+    def _is_duplicate(self, record: Dict) -> bool:
+        preview = (record.get("text_preview") or "").strip()
+        if len(preview) < 200:
+            return False
+        digest = hashlib.sha1(preview.encode("utf-8", "replace")).hexdigest()
+        with self._lock:
+            first = self._content_hashes.setdefault(digest, record["url"])
+        return first != record["url"]
+
+    def _filter_children(self, children: List[str]) -> List[str]:
+        kept = []
+        for child in children:
+            if self.config.strip_params:
+                cleaned = normalize_url(strip_tracking_params(child))
+                if cleaned:
+                    child = cleaned
+            if child in self._seen or child in self._state.seen:
+                continue
+            if not is_crawlable_url(child):
+                self._counts["skipped"] += 1
+                continue
+            if not self._in_scope(child):
+                continue
+            kept.append(child)
+        return kept
 
     def _base_record(self, url: str, depth: int, result) -> Dict:
         return {
@@ -284,32 +457,60 @@ class Crawler:
             "host": (urlsplit(url).hostname or ""),
         }
 
-    def _finalize(self, elapsed: float, started_at: str, seeds) -> Dict:
+    def _finalize(self, elapsed: float, started_at: str, seeds, resumed: bool = False) -> Dict:
         pages = self._pages
         self._pages = []
         successful = [p for p in pages if not p.get("error")]
         all_emails = sorted({e for p in pages for e in (p.get("emails") or [])})
 
+        coverage = None
+        if self.total_known:
+            # Coverage is measured against the sitemap, not against every page we
+            # happened to reach: link discovery can surface pages the sitemap
+            # never listed, and those must not dilute the real figure. The set of
+            # covered sitemap URLs is cumulative across resumed runs.
+            for page in pages:
+                if not page.get("error") and page.get("url") in self._sitemap_urls:
+                    self._state.covered.add(page["url"])
+            sitemap_known = len(self._sitemap_urls)
+            done = len(self._state.covered)
+            coverage = {
+                "known_urls": sitemap_known,
+                "crawled": done,
+                "percent": round(100.0 * done / sitemap_known, 1) if sitemap_known else 0.0,
+                "remaining": max(sitemap_known - done, 0),
+                "off_sitemap_pages": max(len(successful) - done, 0),
+            }
+
         summary = {
             "started_at": started_at,
             "elapsed": round(elapsed, 2),
             "seeds": [u for u, _ in seeds],
+            "resumed": resumed,
             "pages_crawled": len(pages),
             "successful": len(successful),
             "failed": len(pages) - len(successful),
             "skipped": self._counts["skipped"],
             "robots_blocked": self._counts["robots_blocked"],
+            "duplicates": self._counts["duplicates"],
+            "js_rendered_pages": self._js_heavy_pages,
             "total_words": sum(p.get("word_count", 0) or 0 for p in pages),
             "total_bytes": sum(len(p.get("text_preview", "") or "") for p in pages),
             "unique_hosts": len({p.get("host", "") for p in pages if p.get("host")}),
             "all_emails": all_emails,
+            "pending": len(self._state.pending),
+            "coverage": coverage,
+            "site": self.probe.as_dict() if self.probe else None,
             "config": {
                 "max_depth": self.config.max_depth,
                 "max_pages": self.config.max_pages,
+                "unlimited": self.config.unlimited,
                 "concurrency": self.config.concurrency,
                 "delay": self.config.delay,
                 "respect_robots": self.config.respect_robots,
                 "follow_external": self.config.follow_external,
+                "use_sitemap": self.config.use_sitemap,
+                "dedupe_content": self.config.dedupe_content,
                 "user_agent": self.config.user_agent,
             },
         }

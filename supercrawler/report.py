@@ -4,7 +4,7 @@ import csv
 import html
 import json
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 CSV_COLUMNS = [
     "url", "depth", "status", "content_type", "title", "title_length",
@@ -94,20 +94,41 @@ def write_html(path: str, pages: Sequence[Dict], summary: Optional[Dict] = None)
         domain_counts[key] = domain_counts.get(key, 0) + 1
     top_domains = sorted(domain_counts.items(), key=lambda kv: -kv[1])[:10]
 
+    coverage = summary.get("coverage") or {}
     cards = [
         ("Pages crawled", summary.get("pages_crawled", len(pages))),
         ("Success", summary.get("successful", 0)),
         ("Failed", summary.get("failed", 0)),
+        ("Duplicates", summary.get("duplicates", 0)),
         ("Skipped", summary.get("skipped", 0)),
         ("Total words", sum(p.get("word_count", 0) or 0 for p in pages)),
         ("Emails found", len(summary.get("all_emails", []))),
         ("Duration", "%0.1fs" % summary.get("elapsed", 0.0)),
     ]
+    if coverage:
+        cards.insert(1, ("Coverage", "%s%%" % coverage.get("percent", 0)))
+    if summary.get("pending"):
+        cards.append(("Still queued", summary["pending"]))
+    if summary.get("js_rendered_pages"):
+        cards.append(("JS-rendered", summary["js_rendered_pages"]))
     card_html = "".join(
         '<div class="card"><div class="label">%s</div><div class="value">%s</div></div>'
         % (esc(str(label)), esc(str(value)))
         for label, value in cards
     )
+
+    coverage_html = ""
+    if coverage:
+        known = coverage.get("known_urls", 0)
+        got = coverage.get("crawled", 0)
+        coverage_html = (
+            '<h2>Site coverage</h2><div class="panel">'
+            '<div class="row"><span class="dom">sitemap URLs</span>'
+            '<span class="bar">%s</span><span class="num">%d / %d</span></div>'
+            '<p class="muted">%d URL(s) discovered from sitemaps were not reached in '
+            'this run. Re-run with the same --state-file to continue.</p></div>'
+            % (_bar(got, known, 48), got, known, coverage.get("remaining", 0))
+        )
 
     domain_html = "".join(
         '<div class="row"><span class="dom">%s</span><span class="bar">%s</span>'
@@ -189,8 +210,9 @@ a:hover { text-decoration:underline; }
 .emailbox { line-height:2; font-size:13px; }
 </style></head><body>
 <h1>Crawl report</h1>
-<div class="sub">%(started)s · %(seeds)s</div>
+<div class="sub">%(started)s · %(seeds)s%(resumed)s</div>
 <div class="cards">%(cards)s</div>
+%(coverage)s
 <h2>Top hosts</h2><div class="panel">%(domains)s</div>
 <h2>Pages by depth</h2><div class="panel">%(depths)s</div>
 <h2>Emails (%(email_count)d)</h2><div class="panel emailbox">%(emails)s</div>
@@ -202,6 +224,8 @@ a:hover { text-decoration:underline; }
         "started": esc(summary.get("started_at", "")),
         "seeds": esc(", ".join(summary.get("seeds", []))),
         "cards": card_html,
+        "coverage": coverage_html,
+        "resumed": " · resumed" if summary.get("resumed") else "",
         "domains": domain_html,
         "depths": depth_html,
         "emails": email_html,

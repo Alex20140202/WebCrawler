@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 import threading
 import time
-from typing import Dict, Optional
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 

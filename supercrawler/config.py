@@ -30,12 +30,35 @@ class CrawlConfig:
     output_dir: str = "output"
     verbose: bool = True
 
+    use_sitemap: bool = True
+    max_sitemaps: int = 8
+    max_sitemap_entries: int = 100000
+    dedupe_content: bool = True
+    strip_params: bool = True
+    state_file: str = ""
+    stop_on_error_ratio: float = 1.0
+    min_delay_on_errors: float = 5.0
+    auto_tune: bool = True
+
     def merged(self, **overrides) -> "CrawlConfig":
         applied = {k: v for k, v in overrides.items() if v is not None}
         unknown = set(applied) - {f.name for f in self.__dataclass_fields__.values()}
         if unknown:
             raise ValueError("unknown config option(s): %s" % ", ".join(sorted(unknown)))
         return replace(self, **applied)
+
+    @property
+    def unlimited(self) -> bool:
+        """True when the page budget is uncapped."""
+        return self.max_pages <= 0
+
+    @property
+    def unlimited_depth(self) -> bool:
+        """True when the link-depth budget is uncapped.
+
+        Depth 0 means "seed pages only", so it is a real limit, not unlimited.
+        """
+        return self.max_depth < 0
 
 
 PRESETS: Dict[str, CrawlConfig] = {
@@ -48,6 +71,14 @@ PRESETS: Dict[str, CrawlConfig] = {
     ),
     "polite": CrawlConfig(
         max_depth=3, max_pages=300, concurrency=2, per_host_concurrency=1, delay=2.0
+    ),
+    "wholesite": CrawlConfig(
+        max_depth=-1, max_pages=0, concurrency=8, per_host_concurrency=2, delay=0.8,
+        use_sitemap=True, dedupe_content=True,
+    ),
+    "archive": CrawlConfig(
+        max_depth=-1, max_pages=0, concurrency=10, per_host_concurrency=3, delay=0.5,
+        use_sitemap=True, dedupe_content=True, save_html=True,
     ),
 }
 
