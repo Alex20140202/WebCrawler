@@ -331,6 +331,85 @@ Supply your own prompter to make the questions yours:
 Interactor(mode="ask", interactive=True, prompter=my_question_handler)
 ```
 
+## JavaScript-rendered sites
+
+A single-page app returns a near-empty shell to an HTTP client: the content and
+often the navigation are built in the browser. Two things are needed, and
+neither alone is enough.
+
+**1. Route discovery.** With hash routing (`#/blog`) every route is the *same*
+HTTP resource, so link extraction cannot find them. The route table lives in the
+JavaScript instead, so the crawler reads the bundles:
+
+```bash
+python3 crawl.py https://example.com --routes-only
+```
+
+```
+  static routes   : 16
+      /dashboard
+      /blog
+      /notes
+  dynamic routes  : 3
+      /blog/:slug          (needs values for: slug)
+      /u/:username         (needs values for: username)
+```
+
+It understands the common router styles: `route('/x')` calls, `path: '/x'`
+config objects, React Router `<Route path=...>`, `href="#/x"`, and
+`pages/about` style file routes. Bundle imports are followed one level deep so a
+route table in its own module is still found. No extra dependency.
+
+**2. Rendering.** Once a page is known to be a shell, it is loaded in headless
+Chromium and the rendered DOM is parsed instead:
+
+```bash
+python3 -m pip install playwright
+python3 -m playwright install chromium
+
+python3 crawl.py https://example.com --render
+```
+
+The fragment is preserved through rendering. That is the whole point on a
+hash-routed app: `/#/blog` and `/#/notes` differ only in the fragment, so
+dropping it would return an identical page every time.
+
+A page is rendered only when the fetched HTML has almost no visible text, so
+ordinary pages are never slowed down. Rendered HTML is cached on disk under
+`output/render-cache/`, which makes repeat runs and resumed crawls skip the
+browser entirely.
+
+Flags: `--render`, `--render-wait`, `--render-settle`, `--render-timeout`,
+`--render-cache`, `--no-render-cache`, `--no-extract-routes`,
+`--include-dynamic-routes`, `--max-scripts`, `--routes-only`.
+
+If playwright is missing the crawler says so and carries on with what plain HTTP
+could read, rather than failing.
+
+### Logging in to a single-page app
+
+Many SPAs build their login form in the browser and submit JSON to an API, so
+posting the form over plain HTTP cannot work — there is no form in the response
+to post. With `--render`, the login is driven in the page instead: the fields
+are filled, submit is clicked, and the cookies the browser ends up holding are
+copied back into the HTTP session. The report records the method as `browser`.
+
+```bash
+python3 crawl.py https://example.com --render \
+  --login-url 'https://example.com/#/login' -u alice --require-login
+```
+
+A plain HTML login form still goes over HTTP, which is cheaper. The browser path
+is only used when the served HTML has no form.
+
+### Dynamic routes
+
+Routes like `/blog/:slug` cannot be fetched without values. The crawler reports
+them rather than fetching the template, which would render the not-found page.
+Enumerating real values is site-specific: usually its JSON API lists them
+(`/api/articles`), and for a local app the API is often a cleaner crawl target
+than rendered DOM.
+
 ## When it only finds one page
 
 A crawl that stops at the homepage now says which rule stopped it, instead of
@@ -385,7 +464,7 @@ On by default, and worth keeping on:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 167 tests, local fixture server
+python3 -m unittest discover -s tests -v   # 205 tests, local fixture server
 python3 tests/smoke_cli.py                 # end-to-end CLI check
 ```
 
@@ -404,6 +483,8 @@ supercrawler/config.py    CrawlConfig dataclass and presets
 supercrawler/discovery.py sitemap probing, URL policy, size estimation
 supercrawler/scanner.py   DOM scanning: pagers, feeds, forms, walls
 supercrawler/auth.py      login form handling, CSRF, 2FA, session reuse
+supercrawler/routes.py    SPA route extraction from JS bundles
+supercrawler/render.py    headless-browser rendering and its cache
 supercrawler/agent.py     turns signals into queued URLs, read-only
 supercrawler/interact.py  when to ask, when to decide alone
 supercrawler/fetcher.py   HTTP: throttling, robots, retries, byte limits
@@ -417,8 +498,14 @@ tests/                    unit tests and CLI smoke test
 
 ## Limits
 
-- `html.parser` only, so it reads server-rendered HTML. JavaScript-rendered pages
-  are detected and flagged, not rendered. Adding `playwright` would fix that.
+- Without `--render` it reads server-rendered HTML only. JS-rendered pages are
+  detected, flagged and explained rather than reported as successes.
+- `--render` needs playwright and a chromium download, and it is serialised
+  through one browser, so a large SPA crawl is much slower than a plain one.
+- Dynamic routes (`/blog/:slug`) are reported, not fetched: values have to come
+  from the site's own API.
+- A render failure falls back to the shell that plain HTTP returned, so a page
+  can be recorded with thin content rather than being dropped.
 - Login covers ordinary HTML forms with a password field. Sites that authenticate
   through a JS-driven flow or an OAuth redirect need the cookie/header path
   (`--session-file` or `--auth-header`) instead.

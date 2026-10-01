@@ -320,9 +320,11 @@ class RendererDegradationTests(unittest.TestCase):
 
 
 class ConfigRenderTests(unittest.TestCase):
-    def test_render_defaults_off(self):
-        self.assertFalse(CrawlConfig().render)
-        self.assertFalse(CrawlConfig().extract_routes)
+    def test_render_defaults_off_but_route_extraction_on(self):
+        self.assertFalse(CrawlConfig().render,
+                         "rendering needs an explicit opt-in")
+        self.assertTrue(CrawlConfig().extract_routes,
+                        "route discovery is harmless without a browser")
 
     def test_wait_until_is_validated(self):
         CrawlConfig(render_wait_until="networkidle").validate()

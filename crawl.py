@@ -245,6 +245,20 @@ def print_summary(result: dict) -> None:
     if site.get("sitemap_sources"):
         lines.append("  sitemaps        : %s" % ", ".join(site["sitemap_sources"][:3]))
 
+    render = summary.get("render") or {}
+    if render.get("enabled"):
+        lines.append("  rendered        : %d page(s), %d cache hit(s), %d failure(s)"
+                     % (render.get("rendered", 0), render.get("cache_hits", 0),
+                        render.get("failures", 0)))
+    routes = summary.get("routes")
+    if routes and routes.get("static_routes"):
+        lines.append("  js routes       : %d static, %d dynamic (from %d script(s))"
+                     % (routes["static_routes"], routes["dynamic_routes"],
+                        routes["scripts_scanned"]))
+        if routes["dynamic_routes"]:
+            lines.append("  dynamic routes  : %s (need real values)"
+                         % ", ".join(d["path"] for d in routes["dynamic"]))
+
     agent_info = summary.get("agent") or {}
     if agent_info.get("actions_total"):
         lines.append("  agent actions   : %d (%s)"

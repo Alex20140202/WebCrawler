@@ -25,12 +25,21 @@ from .parser import (
     word_frequencies,
 )
 from .interact import Interactor
+from .render import RenderCache, Renderer, RenderResult, playwright_available
 from .report import write_csv, write_html, write_json, write_jsonl, write_reports
+from .routes import (
+    RouteReport,
+    discover_routes,
+    extract_routes_from_js,
+    hash_variants,
+    is_dynamic,
+    route_urls,
+)
 from .scanner import Finding, PageSignals, build_paged_urls, expand_search_form, scan_page
 from .state import CrawlState, load_state, save_state
 from .wizard import build_plan
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
 __all__ = [
     "CrawlConfig",
@@ -64,6 +73,16 @@ __all__ = [
     "LoginResult",
     "AuthError",
     "describe_auth",
+    "Renderer",
+    "RenderCache",
+    "RenderResult",
+    "playwright_available",
+    "discover_routes",
+    "extract_routes_from_js",
+    "route_urls",
+    "hash_variants",
+    "is_dynamic",
+    "RouteReport",
     "CrawlState",
     "save_state",
     "load_state",
