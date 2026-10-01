@@ -101,8 +101,13 @@ def extract_emails(html: str, limit: int = 50) -> List[str]:
     return sorted(found)[:limit]
 
 
-def extract_links(html: str, base_url: str, follow_nofollow: bool = False) -> Dict[str, List[str]]:
-    """Split outgoing links into internal, external, and nofollow buckets."""
+def extract_links(html: str, base_url: str, follow_nofollow: bool = False,
+                  on_nofollow=None) -> Dict[str, List[str]]:
+    """Split outgoing links into internal, external, and nofollow buckets.
+
+    on_nofollow, if given, is called with each nofollow URL so the caller can
+    record why those links were not followed.
+    """
     soup = BeautifulSoup(html, "html.parser")
     internal: List[str] = []
     external: List[str] = []
@@ -123,6 +128,8 @@ def extract_links(html: str, base_url: str, follow_nofollow: bool = False) -> Di
         if is_nofollow and not follow_nofollow:
             if target not in nofollow:
                 nofollow.append(target)
+                if on_nofollow is not None:
+                    on_nofollow(target)
             continue
         bucket = internal if same_site(target, base_url) else external
         if target not in bucket:

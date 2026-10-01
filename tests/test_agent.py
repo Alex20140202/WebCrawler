@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from supercrawler import CrawlConfig, crawl
 from supercrawler.agent import ACTION_LOGIN, ACTION_NEXT, ACTION_PAGINATE, Agent
@@ -361,6 +363,173 @@ class AgentInCrawlTests(unittest.TestCase):
                 payload = json.load(handle)
             self.assertIn("answers", payload)
             self.assertIn("summary", payload)
+
+
+class DiagnosisTests(unittest.TestCase):
+    """A crawl that reaches only one page must say which rule stopped it."""
+
+    def _site(self, index_html, pages=None):
+        table = dict(pages or {})
+        table["/"] = index_html
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = table.get(self.path)
+                if body is None:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                raw = body.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, "http://127.0.0.1:%d" % server.server_address[1]
+
+    def _run(self, base, **over):
+        settings = {"seeds": (base + "/",), "delay": 0.0, "use_sitemap": False,
+                    "max_pages": 20, "max_depth": 3}
+        settings.update(over)
+        return crawl(CrawlConfig(**settings), logger=None)
+
+    def test_no_links_suggests_javascript(self):
+        html = ("<html><head><title>H</title></head><body><div id=root></div>"
+                "<script src=a.js></script><script src=b.js></script>"
+                "<script src=c.js></script></body></html>")
+        server, base = self._site(html)
+        try:
+            result = self._run(base)
+        finally:
+            server.shutdown(); server.server_close()
+        diagnosis = result["summary"]["diagnosis"]
+        self.assertEqual(len(result["pages"]), 1)
+        self.assertEqual(diagnosis["internal_links_found"], 0)
+        self.assertTrue(any("JavaScript" in s for s in diagnosis["suggestions"]))
+        self.assertTrue(any(r["reason"] == "js_rendered"
+                            for r in diagnosis["reasons"]))
+
+    def test_nofollow_is_reported_not_blamed_on_javascript(self):
+        html = ('<html><head><title>H</title></head><body><h1>H</h1>'
+                '<p>%s</p><a href="/a" rel="nofollow">A</a>'
+                '<a href="/b" rel="nofollow">B</a></body></html>' % ("text " * 40))
+        server, base = self._site(html)
+        try:
+            result = self._run(base)
+        finally:
+            server.shutdown(); server.server_close()
+        diagnosis = result["summary"]["diagnosis"]
+        self.assertEqual(len(result["pages"]), 1)
+        self.assertEqual(diagnosis["internal_links_found"], 2)
+        reasons = {r["reason"] for r in diagnosis["reasons"]}
+        self.assertIn("nofollow", reasons)
+        self.assertNotIn("js_rendered", reasons)
+        self.assertFalse(any("JavaScript" in s for s in diagnosis["suggestions"]),
+                         "must not blame JavaScript when nofollow was the cause")
+
+    def test_asset_and_admin_paths_are_reported(self):
+        html = ('<html><body><a href="/admin/x">A</a><a href="/cart">B</a>'
+                '<a href="/f.pdf">P</a></body></html>')
+        server, base = self._site(html)
+        try:
+            result = self._run(base)
+        finally:
+            server.shutdown(); server.server_close()
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("asset_or_admin_path", reasons)
+        self.assertEqual(len(result["pages"]), 1)
+
+    def test_out_of_scope_is_reported(self):
+        html = '<html><body><a href="/a">A</a></body></html>'
+        server, base = self._site(html, {"/a": "<html><body>A</body></html>"})
+        try:
+            result = self._run(base, exclude_patterns=[r"/a"])
+        finally:
+            server.shutdown(); server.server_close()
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("out_of_scope", reasons)
+
+    def test_depth_zero_is_called_out(self):
+        html = '<html><body><a href="/a">A</a></body></html>'
+        server, base = self._site(html, {"/a": "<html><body>A</body></html>"})
+        try:
+            result = self._run(base, max_depth=0)
+        finally:
+            server.shutdown(); server.server_close()
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("depth_limit", reasons)
+
+    def test_page_budget_is_called_out(self):
+        html = '<html><body><a href="/a">A</a></body></html>'
+        server, base = self._site(html, {"/a": "<html><body>A</body></html>"})
+        try:
+            result = self._run(base, max_pages=1)
+        finally:
+            server.shutdown(); server.server_close()
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("page_budget", reasons)
+
+    def test_duplicate_content_is_reported(self):
+        same = "<html><head><title>T</title></head><body><p>%s</p></body></html>" % (
+            "identical boilerplate body text " * 12)
+        html = ('<html><head><title>H</title></head><body><h1>H</h1>'
+                '<a href="/x">X</a><a href="/y">Y</a></body></html>')
+        server, base = self._site(html, {"/x": same, "/y": same})
+        try:
+            result = self._run(base, dedupe_content=True)
+        finally:
+            server.shutdown(); server.server_close()
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("duplicate_content", reasons)
+
+    def test_healthy_crawl_reports_no_reasons(self):
+        pages = {
+            "/a": '<html><head><title>A</title></head><body><h1>A</h1><p>%s</p>'
+                  '<a href="/">H</a></body></html>' % ("alpha text " * 30),
+            "/b": '<html><head><title>B</title></head><body><h1>B</h1><p>%s</p>'
+                  '<a href="/">H</a></body></html>' % ("beta words " * 30),
+        }
+        html = ('<html><head><title>H</title></head><body><h1>H</h1>'
+                '<p>%s</p><a href="/a">A</a><a href="/b">B</a></body></html>'
+                % ("home text " * 30))
+        server, base = self._site(html, pages)
+        try:
+            result = self._run(base)
+        finally:
+            server.shutdown(); server.server_close()
+        diagnosis = result["summary"]["diagnosis"]
+        self.assertEqual(len(result["pages"]), 3)
+        self.assertEqual(diagnosis["internal_links_found"], 4)
+        self.assertEqual(diagnosis["reasons"], [])
+        self.assertEqual(diagnosis["suggestions"], [])
+
+    def test_dropped_examples_are_kept(self):
+        html = '<html><body><a href="/f1.pdf">1</a><a href="/f2.pdf">2</a></body></html>'
+        server, base = self._site(html)
+        try:
+            result = self._run(base)
+        finally:
+            server.shutdown(); server.server_close()
+        examples = result["summary"]["diagnosis"]["dropped_examples"]
+        self.assertTrue(any("f1.pdf" in u for u in examples["asset_or_admin_path"]))
+
+    def test_cli_prints_diagnosis_for_a_one_page_crawl(self):
+        import crawl as cli
+        html = "<html><body><div id=root></div></body></html>"
+        server, base = self._site(html)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                code = cli.main([base + "/", "--no-sitemap", "-q", "-o", tmp])
+        finally:
+            server.shutdown(); server.server_close()
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

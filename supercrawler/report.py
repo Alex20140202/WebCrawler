@@ -180,6 +180,27 @@ def write_html(path: str, pages: Sequence[Dict], summary: Optional[Dict] = None)
         '<a href="mailto:%s">%s</a>' % (esc(e), esc(e)) for e in emails[:200]
     ) or '<p class="muted">None found.</p>'
 
+    diagnosis = summary.get("diagnosis") or {}
+    diagnosis_html = ""
+    reasons = diagnosis.get("reasons") or []
+    suggestions = diagnosis.get("suggestions") or []
+    if reasons or suggestions:
+        items = "".join(
+            '<div class="row"><span class="dom">%s (x%d)</span>'
+            '<span class="num">%s</span></div>'
+            % (esc(item["reason"]), item["count"], esc(item["explanation"]))
+            for item in reasons
+        )
+        tips = "".join('<li>%s</li>' % esc(tip) for tip in suggestions)
+        diagnosis_html = (
+            '<h2>Why the crawl stopped there</h2><div class="panel">'
+            '<p class="muted">%d page(s) fetched, %d internal link(s) seen.</p>%s%s</div>'
+            % (diagnosis.get("pages_fetched", 0),
+               diagnosis.get("internal_links_found", 0),
+               items or '<p class="muted">Nothing was suppressed.</p>',
+               ('<ul>%s</ul>' % tips) if tips else "")
+        )
+
     agent_info = summary.get("agent") or {}
     actions = agent_info.get("actions_by_kind") or {}
     interaction = agent_info.get("interactions") or {}
@@ -273,7 +294,7 @@ a:hover { text-decoration:underline; }
 <h2>Top hosts</h2><div class="panel">%(domains)s</div>
 <h2>Pages by depth</h2><div class="panel">%(depths)s</div>
 <h2>Emails (%(email_count)d)</h2><div class="panel emailbox">%(emails)s</div>
-%(agent)s%(walls)s%(auth)s
+%(diagnosis)s%(agent)s%(walls)s%(auth)s
 <h2>Pages (%(page_count)d)</h2>
 <table><thead><tr><th>URL</th><th>Depth</th><th>Status</th><th>Title</th>
 <th>Words</th><th>Meta</th><th>Links</th></tr></thead><tbody>%(rows)s</tbody></table>
@@ -287,6 +308,7 @@ a:hover { text-decoration:underline; }
         "domains": domain_html,
         "depths": depth_html,
         "emails": email_html,
+        "diagnosis": diagnosis_html,
         "agent": agent_html,
         "walls": wall_html,
         "auth": auth_html,

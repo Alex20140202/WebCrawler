@@ -52,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv-out", help="custom path for the CSV report")
     parser.add_argument("--no-reports", action="store_true", help="do not write report files")
     parser.add_argument("-q", "--quiet", action="store_true", help="suppress progress output")
+    parser.add_argument("--explain", action="store_true",
+                        help="always print why the crawl reached the pages it did "
+                             "(printed automatically for 1-2 page crawls)")
     parser.set_defaults(interaction_mode=None)
 
     smart = parser.add_argument_group("smart whole-site mode")
@@ -306,6 +309,28 @@ def run_wizard() -> int:
     return 0
 
 
+def print_diagnosis(result: dict) -> None:
+    """Explain a small or empty crawl in terms of the rule that caused it."""
+    diagnosis = (result.get("summary") or {}).get("diagnosis") or {}
+    reasons = diagnosis.get("reasons") or []
+    suggestions = diagnosis.get("suggestions") or []
+    if not reasons and not suggestions:
+        return
+
+    print("")
+    print("=" * 58)
+    print("  why this crawl stopped where it did")
+    print("=" * 58)
+    print("  pages fetched   : %d" % diagnosis.get("pages_fetched", 0))
+    print("  links found     : %d internal" % diagnosis.get("internal_links_found", 0))
+    for item in reasons:
+        print("  - %s (x%d): %s" % (item["reason"], item["count"],
+                                   item["explanation"]))
+    for tip in suggestions:
+        print("\n  -> %s" % tip)
+    print("=" * 58)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -377,6 +402,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     print_summary(result)
+    if args.explain or len(result["pages"]) <= 2:
+        print_diagnosis(result)
     return 0
 
 

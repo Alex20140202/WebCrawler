@@ -331,6 +331,40 @@ Supply your own prompter to make the questions yours:
 Interactor(mode="ask", interactive=True, prompter=my_question_handler)
 ```
 
+## When it only finds one page
+
+A crawl that stops at the homepage now says which rule stopped it, instead of
+just reporting a low number. It prints automatically whenever the run fetched
+1-2 pages, or on demand with `--explain`:
+
+```
+  why this crawl stopped where it did
+==============================================================
+  pages fetched   : 1
+  links found     : 0 internal
+  - js_rendered (x1): pages had no server-side text; content is rendered by
+                      JavaScript, which this crawler does not execute
+  -> No server-side links were found. The site almost certainly renders its
+     pages with JavaScript; add a browser renderer (playwright) ...
+```
+
+The causes it distinguishes:
+
+| reason | what it means |
+|--------|---------------|
+| `js_rendered` | the page had no server-side links or text; a JS framework builds the DOM |
+| `nofollow` | links existed but carried `rel=nofollow` (`--follow-nofollow` overrides) |
+| `asset_or_admin_path` | links were `.pdf`/`.js` files, or `/admin`, `/cart`, `/login` |
+| `out_of_scope` | links left the site, or `--include`/`--exclude` rejected them |
+| `duplicate_content` | pages had identical text to one already crawled (`--keep-duplicates`) |
+| `depth_limit` | `--max-depth 0` fetches the seed page only |
+| `page_budget` | hit `--max-pages` |
+| `no_pages` | the seed itself could not be fetched |
+
+Per-run counts for all of these, plus example dropped URLs, land in
+`report.json` under `summary.diagnosis`, and the HTML report shows the same
+section.
+
 ## Politeness and scope
 
 On by default, and worth keeping on:
@@ -351,7 +385,7 @@ On by default, and worth keeping on:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 157 tests, local fixture server
+python3 -m unittest discover -s tests -v   # 167 tests, local fixture server
 python3 tests/smoke_cli.py                 # end-to-end CLI check
 ```
 

@@ -49,6 +49,7 @@ class Crawler:
         self._lock = threading.Lock()
         self._pages: List[Dict] = []
         self._counts = {"skipped": 0, "robots_blocked": 0, "errors": 0, "duplicates": 0}
+        self._drop_examples: Dict[str, List[str]] = {}
         self._content_hashes: Dict[str, str] = {}
         self._state = CrawlState()
         self.probe = None
@@ -400,11 +401,14 @@ class Crawler:
 
         if self.config.dedupe_content and self._is_duplicate(record):
             self._counts["duplicates"] += 1
+            self._drop("duplicate_content")
+            self._note_drop(url, "duplicate_content")
             record["duplicate"] = True
             self._log("  = %s (duplicate content)" % url)
             return record, []
 
-        links = extract_links(html_text, result.url, self.config.follow_nofollow)
+        links = extract_links(html_text, result.url, self.config.follow_nofollow,
+                          on_nofollow=self._on_nofollow_link)
         record["internal_links"] = links["internal"]
         record["external_links"] = links["external"]
         record["internal_links_count"] = len(links["internal"])
@@ -447,6 +451,10 @@ class Crawler:
                      len(links["internal"]), len(links["external"])))
         return record, children
 
+    def _on_nofollow_link(self, url: str) -> None:
+        self._drop("nofollow")
+        self._note_drop(url, "nofollow")
+
     def _is_duplicate(self, record: Dict) -> bool:
         preview = (record.get("text_preview") or "").strip()
         if len(preview) < 200:
@@ -464,14 +472,139 @@ class Crawler:
                 if cleaned:
                     child = cleaned
             if child in self._seen or child in self._state.seen:
+                self._drop("already_seen")
                 continue
             if not is_crawlable_url(child):
-                self._counts["skipped"] += 1
+                self._drop("asset_or_admin_path")
+                self._note_drop(child, "asset_or_admin_path")
                 continue
             if not self._in_scope(child):
+                self._drop("out_of_scope")
+                self._note_drop(child, "out_of_scope")
                 continue
             kept.append(child)
         return kept
+
+    def _drop(self, reason: str, count: int = 1) -> None:
+        self._counts[reason] = self._counts.get(reason, 0) + count
+
+    def _note_drop(self, url: str, reason: str, cap: int = 12) -> None:
+        """Keep a few examples so a report can show what was dropped and why."""
+        bucket = self._drop_examples.setdefault(reason, [])
+        if len(bucket) < cap:
+            bucket.append(url)
+
+    def _diagnose(self, pages: List[Dict], seeds) -> Dict:
+        """Explain why the crawl reached the pages it did.
+
+        Every reason a candidate URL was discarded is counted, so a crawl that
+        only found the homepage says which rule stopped it instead of just
+        reporting a low number.
+        """
+        reachable = [p for p in pages if not p.get("error")]
+        nofollow_links = sum(p.get("nofollow_links_count", 0) or 0 for p in reachable)
+        links_seen = (sum(len(p.get("internal_links") or []) for p in reachable)
+                      + nofollow_links)
+        no_links = [p["url"] for p in reachable
+                    if not p.get("internal_links") and not p.get("js_rendered")]
+
+        reasons = []
+        assets = self._counts.get("asset_or_admin_path", 0)
+        if assets:
+            reasons.append(("asset_or_admin_path", assets,
+                            "links were files (.pdf, .js) or admin/cart paths"))
+
+        scope = self._counts.get("out_of_scope", 0)
+        if scope:
+            reasons.append(("out_of_scope", scope,
+                            "links left the site or matched no --include pattern"))
+
+        nofollow = self._counts.get("nofollow", 0)
+        if nofollow:
+            reasons.append(("nofollow", nofollow,
+                            "links carried rel=nofollow, which is not followed"))
+
+        dupes = self._counts.get("duplicate_content", 0)
+        if dupes:
+            reasons.append(("duplicate_content", dupes,
+                            "pages had identical text to a page already crawled, "
+                            "so they were not expanded"))
+
+        js_pages = [p["url"] for p in pages if p.get("js_rendered")]
+        if js_pages:
+            reasons.append(("js_rendered", len(js_pages),
+                            "pages had no server-side text; content is rendered by "
+                            "JavaScript, which this crawler does not execute"))
+
+        if self.config.max_depth == 0 and len(pages) == 1:
+            reasons.append(("depth_limit", 1,
+                            "--max-depth 0 fetches the seed page only"))
+        if not self.config.unlimited and len(pages) >= self.config.max_pages:
+            reasons.append(("page_budget", self.config.max_pages,
+                            "hit --max-pages; raise it or use 0 for unlimited"))
+
+        if not pages:
+            reasons.append(("no_pages", 0, "the seed pages could not be fetched"))
+
+        suggestions = []
+        if links_seen == 0 and reachable:
+            suggestions.append(
+                "No server-side links were found. The site almost certainly "
+                "renders its pages with JavaScript; add a browser renderer "
+                "(playwright) or point --login-url at a server-rendered section."
+            )
+        elif nofollow_links and not any(
+                r[0] == "js_rendered" for r in reasons):
+            suggestions.append(
+                "%d link(s) exist but are rel=nofollow, so they were not followed."
+                % nofollow_links
+            )
+        if any(r[0] == "js_rendered" for r in reasons):
+            suggestions.append(
+                "%d page(s) were flagged as JS-rendered: titles and text may be "
+                "empty even though they were fetched." % len(js_pages)
+            )
+        if any(r[0] == "out_of_scope" for r in reasons):
+            suggestions.append(
+                "Some links were outside the crawl scope. Drop --include/--exclude, "
+                "or pass --follow-external to cross domains."
+            )
+        if any(r[0] == "asset_or_admin_path" for r in reasons):
+            suggestions.append(
+                "Assets and admin/cart/login paths are skipped by design. "
+                "--include cannot re-admit them; use --follow-external or a "
+                "wider --preset if you need them."
+            )
+        if any(r[0] == "nofollow" for r in reasons):
+            suggestions.append(
+                "rel=nofollow links are respected. Add --follow-nofollow only if "
+                "you own the site and want them crawled."
+            )
+        if any(r[0] == "duplicate_content" for r in reasons):
+            suggestions.append(
+                "%d page(s) looked identical to an earlier page and were not "
+                "expanded. Add --keep-duplicates if that is wrong."
+                % dupes
+            )
+
+        return {
+            "pages_fetched": len(pages),
+            "pages_ok": len(reachable),
+            "internal_links_found": links_seen,
+            "pages_with_no_links": no_links[:12],
+            "counts": {
+                "links_already_crawled": self._counts.get("already_seen", 0),
+                "links_dropped_asset_or_admin": assets,
+                "links_dropped_out_of_scope": scope,
+                "links_not_followed_nofollow": nofollow,
+                "pages_dropped_duplicate": dupes,
+                "robots_blocked": self._counts.get("robots_blocked", 0),
+            },
+            "reasons": [{"reason": r, "count": c, "explanation": e}
+                        for r, c, e in sorted(reasons, key=lambda x: -x[1])],
+            "dropped_examples": {k: v for k, v in self._drop_examples.items()},
+            "suggestions": suggestions,
+        }
 
     def _base_record(self, url: str, depth: int, result) -> Dict:
         return {
@@ -549,6 +682,7 @@ class Crawler:
             "coverage": coverage,
             "agent": self.agent.summary(),
             "auth": self._auth_summary(),
+            "diagnosis": self._diagnose(pages, seeds),
             "login_walls": sorted({p["url"] for p in pages if p.get("needs_login")}),
             "site": self.probe.as_dict() if self.probe else None,
             "config": {
