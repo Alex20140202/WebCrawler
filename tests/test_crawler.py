@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from supercrawler import CrawlConfig, crawl, normalize_url, registrable_domain
+from supercrawler.report import write_reports
+
+INDEX = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>  Home &amp; Index  </title>
+<meta name="description" content="Fixture home page">
+<meta property="og:title" content="Home">
+<meta name="viewport" content="width=device-width">
+<meta name="keywords" content="fixture, testing, crawler">
+<link rel="canonical" href="/index.html">
+</head>
+<body>
+<h1>Home</h1>
+<p>Contact us at hello@example.com for details about crawling testing fixtures.</p>
+<a href="/about.html">About</a>
+<a href="/deep/page.html">Deep</a>
+<a href="http://external.test/elsewhere">External</a>
+<a href="/private.html" rel="nofollow">NoFollow</a>
+<a href="mailto:hello@example.com">Mail</a>
+<a href="javascript:void(0)">JS</a>
+<a href="/dup.html">Dup</a>
+<a href="/dup.html#frag">Dup fragment</a>
+<a href="//localhost:%(port)s/index.html">Protocol relative</a>
+<img src="/logo.png" alt="Logo">
+<img src="/bare.png">
+</body>
+</html>
+"""
+
+ABOUT = """<html><head><title>About</title></head><body>
+<h1>About</h1><p>Short page.</p><a href="/">home</a></body></html>
+"""
+
+DEEP = """<html><head><title>Deep page</title>
+<meta name="description" content="Level two"></head><body>
+<h1>Deep</h1><p>Reached at depth two through about.</p>
+<a href="/deeper.html">Deeper</a></body></html>
+"""
+
+DEEPER = """<html><head><title>Deeper page</title></head><body>
+<h1>Deeper</h1><p>Content at depth two.</p>
+<a href="/deepest.html">Deepest</a></body></html>
+"""
+
+DEEPEST = """<html><head><title>Deepest page</title></head><body>
+<h1>Deepest</h1><p>At depth three, beyond max_depth of two.</p></body></html>
+"""
+
+DUP = "<html><head><title>Dup</title></head><body><p>dup target</p></body></html>"
+PRIVATE = "<html><head><title>Private</title></head><body><p>should not be fetched</p></body></html>"
+NOTFOUND = "<html><body>gone</body></html>"
+
+ROBOTS = """User-agent: *
+Disallow: /private.html
+Crawl-delay: 0
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    port = 0
+
+    def log_message(self, *args):
+        pass
+
+    def _respond(self, status, body, content_type="text/html; charset=utf-8"):
+        raw = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/robots.txt":
+            self._respond(200, ROBOTS, "text/plain")
+        elif path in ("/", "/index.html"):
+            self._respond(200, INDEX % {"port": self.port})
+        elif path == "/about.html":
+            self._respond(200, ABOUT)
+        elif path == "/deep/page.html":
+            self._respond(200, DEEP)
+        elif path == "/deeper.html":
+            self._respond(200, DEEPER)
+        elif path == "/deepest.html":
+            self._respond(200, DEEPEST)
+        elif path == "/dup.html":
+            self._respond(200, DUP)
+        elif path == "/private.html":
+            self._respond(200, PRIVATE)
+        elif path == "/missing.html":
+            self._respond(404, NOTFOUND)
+        elif path == "/notes.txt":
+            self._respond(200, "plain text", "text/plain")
+        elif path == "/loop.html":
+            self._respond(302, "", "text/html")
+            self.send_header("Location", "/loop2.html")
+            self.end_headers()
+        else:
+            self._respond(404, NOTFOUND)
+
+
+class LocalSite:
+    def __init__(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        Handler.port = self.port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+        return False
+
+    @property
+    def base(self):
+        return "http://127.0.0.1:%d" % self.port
+
+
+class NormalizeUrlTests(unittest.TestCase):
+    def test_strips_fragment_and_default_port(self):
+        self.assertEqual(normalize_url("http://Example.COM:80/a#frag"), "http://example.com/a")
+
+    def test_drops_non_http_schemes(self):
+        for url in ("mailto:a@b.com", "javascript:void(0)", "tel:+123", "data:text/html,x", ""):
+            self.assertIsNone(normalize_url(url), url)
+
+    def test_resolves_relative_and_collapses_slashes(self):
+        self.assertEqual(normalize_url("../b", "http://x.com/a/c/d"), "http://x.com/a/b")
+        self.assertEqual(normalize_url("/a//b//", "http://x.com/"), "http://x.com/a/b")
+
+    def test_keeps_query_and_non_default_port(self):
+        self.assertEqual(normalize_url("http://x.com:8080/p?b=2&a=1"), "http://x.com:8080/p?b=2&a=1")
+
+    def test_registrable_domain(self):
+        self.assertEqual(registrable_domain("www.example.com"), "example.com")
+        self.assertEqual(registrable_domain("a.b.example.co.uk"), "example.co.uk")
+        self.assertEqual(registrable_domain("localhost"), "localhost")
+
+
+class CrawlTests(unittest.TestCase):
+    def test_crawls_within_scope_and_depth(self):
+        with LocalSite() as site:
+            config = CrawlConfig(
+                seeds=[site.base + "/"],
+                max_depth=2,
+                max_pages=50,
+                delay=0.0,
+                concurrency=4,
+                per_host_concurrency=4,
+            )
+            result = crawl(config, logger=None)
+
+        pages = {p["url"]: p for p in result["pages"]}
+        summary = result["summary"]
+
+        self.assertGreaterEqual(summary["pages_crawled"], 4)
+        self.assertGreater(summary["successful"], 0)
+        self.assertIn(site.base + "/about.html", pages)
+        self.assertIn(site.base + "/deep/page.html", pages)
+        self.assertIn(site.base + "/deeper.html", pages)
+        self.assertNotIn(site.base + "/deepest.html", pages, "depth limit not enforced")
+        self.assertEqual(pages[site.base + "/deeper.html"]["depth"], 2)
+        self.assertNotIn(site.base + "/private.html", pages, "robots.txt not respected")
+        self.assertNotIn("http://external.test/elsewhere", pages, "external link followed")
+
+        home = pages[site.base + "/"]
+        self.assertEqual(home["title"], "Home & Index")
+        self.assertEqual(home["lang"], "en")
+        self.assertEqual(home["meta_description"], "Fixture home page")
+        self.assertTrue(home["has_og"])
+        self.assertTrue(home["has_viewport"])
+        self.assertEqual(home["h1_count"], 1)
+        self.assertGreater(home["word_count"], 5)
+        self.assertEqual(home["images_missing_alt"], 1)
+        self.assertIn("hello@example.com", home["emails"])
+        self.assertEqual(home["canonical"], site.base + "/index.html")
+
+        targets = {u.split("/")[-1] for u in home["internal_links"]}
+        self.assertIn("about.html", targets)
+        self.assertIn("http://external.test/elsewhere", home["external_links"])
+        self.assertNotIn("http://external.test/elsewhere", home["internal_links"])
+        self.assertEqual(home["nofollow_links_count"], 1)
+
+    def test_depth_limit_zero_fetches_only_seeds(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/"], max_depth=0, delay=0.0)
+            result = crawl(config, logger=None)
+        self.assertEqual(result["summary"]["pages_crawled"], 1)
+
+    def test_max_pages_caps_results(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/"], max_depth=3, max_pages=2, delay=0.0)
+            result = crawl(config, logger=None)
+        self.assertLessEqual(result["summary"]["pages_crawled"], 2)
+
+    def test_404_recorded_without_children(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/missing.html"], delay=0.0)
+            result = crawl(config, logger=None)
+        page = result["pages"][0]
+        self.assertEqual(page["status"], 404)
+        self.assertEqual(page["internal_links"], [])
+        self.assertEqual(result["summary"]["failed"], 1)
+
+    def test_non_html_is_recorded_but_not_parsed(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/notes.txt"], delay=0.0)
+            result = crawl(config, logger=None)
+        page = result["pages"][0]
+        self.assertEqual(page["content_type"], "text/plain")
+        self.assertEqual(page["skipped"], True)
+        self.assertNotIn("title", page)
+        self.assertEqual(result["summary"]["skipped"], 1)
+
+    def test_include_pattern_filters_urls(self):
+        with LocalSite() as site:
+            config = CrawlConfig(
+                seeds=[site.base + "/"],
+                include_patterns=[r"about"],
+                max_depth=2,
+                delay=0.0,
+            )
+            result = crawl(config, logger=None)
+        urls = [p["url"] for p in result["pages"]]
+        self.assertEqual(set(urls), {site.base + "/", site.base + "/about.html"})
+
+    def test_exclude_pattern_skips_discovered_links(self):
+        with LocalSite() as site:
+            config = CrawlConfig(
+                seeds=[site.base + "/"],
+                exclude_patterns=[r"/deep"],
+                max_depth=3,
+                delay=0.0,
+            )
+            result = crawl(config, logger=None)
+        urls = [p["url"] for p in result["pages"]]
+        self.assertIn(site.base + "/about.html", urls)
+        self.assertNotIn(site.base + "/deep/page.html", urls)
+        self.assertNotIn(site.base + "/deeper.html", urls)
+
+    def test_seeds_bypass_include_filter(self):
+        with LocalSite() as site:
+            config = CrawlConfig(
+                seeds=[site.base + "/about.html"],
+                include_patterns=[r"never-matches-anything"],
+                delay=0.0,
+            )
+            result = crawl(config, logger=None)
+        self.assertEqual([p["url"] for p in result["pages"]], [site.base + "/about.html"])
+
+    def test_ignore_robots_allows_blocked_page(self):
+        with LocalSite() as site:
+            config = CrawlConfig(
+                seeds=[site.base + "/private.html"],
+                respect_robots=False, delay=0.0,
+            )
+            result = crawl(config, logger=None)
+        urls = [p["url"] for p in result["pages"]]
+        self.assertIn(site.base + "/private.html", urls)
+
+    def test_deduplicates_urls(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/"], max_depth=2, delay=0.0)
+            result = crawl(config, logger=None)
+        urls = [p["url"] for p in result["pages"]]
+        self.assertEqual(len(urls), len(set(urls)))
+
+    def test_invalid_seed_raises(self):
+        config = CrawlConfig(seeds=["mailto:nope@example.com"])
+        with self.assertRaises(ValueError):
+            crawl(config, logger=None)
+
+    def test_save_html_writes_files(self):
+        with LocalSite() as site, tempfile.TemporaryDirectory() as tmp:
+            config = CrawlConfig(
+                seeds=[site.base + "/about.html"], delay=0.0,
+                save_html=True, output_dir=tmp,
+            )
+            result = crawl(config, logger=None)
+            saved = result["pages"][0]["saved_html"]
+            self.assertTrue(os.path.exists(saved))
+            with open(saved, encoding="utf-8") as handle:
+                self.assertIn("About", handle.read())
+
+
+class ReportTests(unittest.TestCase):
+    def test_reports_written_and_readable(self):
+        with LocalSite() as site:
+            config = CrawlConfig(seeds=[site.base + "/"], max_depth=1, delay=0.0)
+            result = crawl(config, logger=None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            written = write_reports(result["pages"], result["summary"], output_dir=tmp)
+            self.assertEqual(set(written), {"json", "jsonl", "csv", "html"})
+            for path in written.values():
+                self.assertTrue(os.path.exists(path), path)
+                self.assertGreater(os.path.getsize(path), 0, path)
+
+            with open(written["json"], encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["summary"]["pages_crawled"], len(payload["pages"]))
+
+            with open(written["csv"], encoding="utf-8") as handle:
+                lines = handle.read().strip().splitlines()
+            self.assertEqual(lines[0].split(",")[0], "url")
+            self.assertEqual(len(lines) - 1, len(payload["pages"]))
+
+            with open(written["jsonl"], encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual(len(records), len(payload["pages"]))
+
+            with open(written["html"], encoding="utf-8") as handle:
+                document = handle.read()
+            self.assertIn("<!DOCTYPE html>", document)
+            self.assertIn("Pages crawled", document)
+            self.assertIn("hello@example.com", document)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_merged_rejects_unknown_option(self):
+        with self.assertRaises(ValueError):
+            CrawlConfig().merged(nonexistent=1)
+
+    def test_merged_ignores_none(self):
+        base = CrawlConfig()
+        self.assertEqual(base.merged(max_depth=None), base)
+
+    def test_merged_overrides(self):
+        self.assertEqual(CrawlConfig().merged(max_depth=9).max_depth, 9)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+report.json
+report.html
+report.csv
+pages.jsonl
+output/
+.venv/
+.DS_Store
+.idea/
