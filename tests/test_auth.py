@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -11,9 +13,12 @@ from supercrawler.auth import (
     AuthError,
     Authenticator,
     describe_auth,
+    describe_token,
     find_login_form,
     has_captcha,
+    inspect_token,
     looks_logged_in,
+    mask,
     needs_totp,
     pick_field,
     redact,
@@ -354,6 +359,107 @@ class CrawlWithLoginTests(unittest.TestCase):
         self.assertTrue(CrawlConfig(login_url="https://x.test/login").has_login)
         self.assertTrue(CrawlConfig(auth_header="A: b").has_login)
         self.assertTrue(CrawlConfig(session_file="/tmp/s.json").has_login)
+
+
+class TokenInspectionTests(unittest.TestCase):
+    @staticmethod
+    def _jwt(claims, header=None):
+        def seg(obj):
+            return base64.urlsafe_b64encode(
+                json.dumps(obj).encode()).decode().rstrip("=")
+        return "%s.%s.signature" % (seg(header or {"alg": "HS256", "typ": "JWT"}),
+                                    seg(claims))
+
+    def test_splits_scheme_and_header_name(self):
+        info = inspect_token("Authorization: Bearer abc123")
+        self.assertTrue(info["valid_header"])
+        self.assertEqual(info["name"], "Authorization")
+        self.assertEqual(info["scheme"], "Bearer")
+
+    def test_non_bearer_header_names(self):
+        for raw, name in (("PRIVATE-TOKEN: glpat-x", "PRIVATE-TOKEN"),
+                          ("X-API-Key: k-1", "X-API-Key")):
+            info = inspect_token(raw)
+            self.assertTrue(info["valid_header"])
+            self.assertEqual(info["name"], name)
+
+    def test_equals_separator_accepted(self):
+        info = inspect_token("X-Token=k-1")
+        self.assertTrue(info["valid_header"])
+        self.assertEqual(info["name"], "X-Token")
+
+    def test_bare_value_rejected(self):
+        info = inspect_token("just-a-token")
+        self.assertFalse(info["valid_header"])
+        self.assertIn("Name: value", info["notes"][0])
+
+    def test_empty_rejected(self):
+        self.assertFalse(inspect_token("")["valid_header"])
+
+    def test_missing_scheme_is_flagged(self):
+        info = inspect_token("Authorization: abc123")
+        self.assertTrue(any("scheme" in n for n in info["notes"]))
+
+    def test_valid_jwt_claims_decoded(self):
+        now = int(time.time())
+        token = self._jwt({"iss": "https://api.example.com", "sub": "u1",
+                           "aud": "crawler", "scope": "repo:read",
+                           "exp": now + 3600})
+        info = inspect_token("Authorization: Bearer " + token)
+        self.assertTrue(info["looks_like_jwt"])
+        self.assertEqual(info["claims"]["sub"], "u1")
+        self.assertEqual(info["claims"]["scope"], "repo:read")
+        self.assertFalse(info["expired"])
+        self.assertGreater(info["expires_in"], 3500)
+
+    def test_expired_jwt_detected(self):
+        now = int(time.time())
+        info = inspect_token("Authorization: Bearer " + self._jwt({"exp": now - 60}))
+        self.assertTrue(info["expired"])
+        self.assertIn("EXPIRED", describe_token(
+            "Authorization: Bearer " + self._jwt({"exp": now - 60})))
+
+    def test_not_yet_valid_detected(self):
+        now = int(time.time())
+        info = inspect_token("Authorization: Bearer "
+                             + self._jwt({"exp": now + 60, "nbf": now + 600}))
+        self.assertTrue(info["not_yet_valid"])
+
+    def test_opaque_token_reported_without_claims(self):
+        info = inspect_token("Authorization: Bearer ghp_16C7e42F292c")
+        self.assertFalse(info["looks_like_jwt"])
+        self.assertEqual(info["claims"], {})
+
+    def test_malformed_jwt_does_not_crash(self):
+        info = inspect_token("Authorization: Bearer aaa.bbb.ccc")
+        self.assertTrue(info["valid_header"])
+        self.assertTrue(any("base64" in n or "JSON" in n for n in info["notes"]))
+
+    def test_two_segment_garbage_reported(self):
+        info = inspect_token("Authorization: Bearer aaa.bbb")
+        self.assertFalse(info["looks_like_jwt"])
+
+    def test_masking_never_shows_the_whole_secret(self):
+        secret = "supersecrettokenvalue"
+        preview = mask(secret)
+        self.assertNotIn(secret, preview)
+        self.assertTrue(preview.startswith("supe"))
+
+    def test_short_secret_fully_masked(self):
+        self.assertEqual(mask("abc"), "***")
+
+    def test_describe_never_contains_the_raw_token(self):
+        secret = "eyJraWQiOiJzZWNyZXQifQ.payloadpart.signature"
+        blob = describe_token("Authorization: Bearer " + secret)
+        self.assertNotIn("payloadpart", blob)
+
+
+class AuthErrorExitTests(unittest.TestCase):
+    def test_check_auth_header_exits_nonzero_for_bad_input(self):
+        import crawl as cli
+        self.assertEqual(cli.main(["--check-auth-header", "bare-token"]), 1)
+        self.assertEqual(cli.main(["--check-auth-header", ""]), 1)
+        self.assertEqual(cli.main(["--check-auth-header", "X-API-Key: k-1"]), 0)
 
 
 if __name__ == "__main__":

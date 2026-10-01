@@ -74,6 +74,40 @@ python3 crawl.py https://api.example.com \
   --auth-header 'Authorization: Bearer ghp_xxx'
 ```
 
+Where the token comes from, in rough order of preference:
+
+1. **The service's own token page.** Settings -> Developer settings -> Personal
+   access tokens on GitHub; Preferences -> Access tokens on GitLab; the API keys
+   page on Stripe, npm, Slack and friends. Generate one with the scopes you need.
+2. **A CLI you already have authenticated.**
+   `gh auth token`, `gcloud auth print-access-token`,
+   `az account get-access-token --resource-type https://management.azure.com/`.
+3. **Your own browser session.** Devtools -> Network -> pick a request -> Request
+   Headers -> copy `Authorization`, `PRIVATE-TOKEN`, or `X-API-Key`.
+4. **Config already on disk.** `~/.netrc`, `~/.aws/credentials`,
+   `~/.docker/config.json`.
+
+The header name and format are not standardised:
+
+| service | header |
+|---------|--------|
+| GitHub | `Authorization: Bearer ghp_...` |
+| GitLab | `PRIVATE-TOKEN: glpat-...` |
+| Stripe | `Authorization: Bearer sk_live_...` |
+| various APIs | `X-API-Key: ...`, `X-Auth-Token: ...` |
+
+Check what you got before spending a crawl on it:
+
+```bash
+python3 crawl.py --check-auth-header 'Authorization: Bearer ghp_xxx'
+```
+
+This decodes a JWT payload locally to show `iss`, `sub`, `aud`, `scope` and
+whether it has expired, and flags a missing `Bearer` scheme or a bare value with
+no header name. The value is masked in the output, nothing is sent anywhere, and
+nothing is written to disk. Exits non-zero if the header is not usable, so it
+works as a pre-flight check in a script.
+
 ### Option 4 - bring your own session
 
 If you would rather not hand over a password, sign in with your browser and
@@ -317,7 +351,7 @@ On by default, and worth keeping on:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 141 tests, local fixture server
+python3 -m unittest discover -s tests -v   # 157 tests, local fixture server
 python3 tests/smoke_cli.py                 # end-to-end CLI check
 ```
 

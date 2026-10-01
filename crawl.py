@@ -109,6 +109,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="save/reuse cookies so repeat runs skip the login form")
     auth.add_argument("--require-login", action="store_true",
                       help="abort instead of crawling anonymously if login fails")
+    auth.add_argument("--check-auth-header", metavar="'Name: value'",
+                      help="inspect an auth header locally (shape, expiry, scopes) "
+                           "and exit; the value is never sent anywhere")
     return parser
 
 
@@ -308,6 +311,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.wizard:
         return run_wizard()
+
+    if args.check_auth_header is not None:
+        from supercrawler.auth import describe_token, inspect_token
+        print("\n" + "=" * 58)
+        print("  auth header check")
+        print("=" * 58)
+        if not args.check_auth_header.strip():
+            print("  header        : INVALID (no value given)")
+        else:
+            print(describe_token(args.check_auth_header))
+        print("=" * 58)
+        return 0 if inspect_token(args.check_auth_header)["valid_header"] else 1
 
     if not args.seeds:
         print("error: at least one URL is required (or use --wizard)", file=sys.stderr)

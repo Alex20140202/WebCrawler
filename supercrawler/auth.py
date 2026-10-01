@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
+import time
+from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlsplit
 
@@ -478,6 +482,166 @@ def _split_header(raw: str) -> Tuple[str, str]:
         name, value = raw.split("=", 1)
         return name.strip(), value.strip()
     return "", ""
+
+
+def mask(value: str, keep: int = 4) -> str:
+    """Show enough of a secret to recognize it, never enough to use it."""
+    if not value:
+        return "(empty)"
+    if len(value) <= keep * 2:
+        return "*" * len(value)
+    return "%s...%s (%d chars)" % (value[:keep], value[-keep:], len(value))
+
+
+def _b64url_decode(segment: str) -> Optional[bytes]:
+    padding = "=" * (-len(segment) % 4)
+    try:
+        return base64.urlsafe_b64decode(segment + padding)
+    except (ValueError, binascii.Error):
+        return None
+
+
+def inspect_token(raw: str) -> Dict:
+    """Describe an auth header locally: shape, and JWT claims if it is one.
+
+    Decodes only the token's own payload, which is not encrypted. Nothing is
+    sent anywhere and nothing is written to disk.
+    """
+    info = {
+        "valid_header": False,
+        "name": "",
+        "scheme": "",
+        "value_preview": "",
+        "looks_like_jwt": False,
+        "claims": {},
+        "expired": None,
+        "expires_in": None,
+        "not_yet_valid": False,
+        "notes": [],
+    }
+    if not raw or not raw.strip():
+        info["notes"].append("empty")
+        return info
+
+    name, value = _split_header(raw)
+    if not name or not value:
+        info["notes"].append(
+            "expected 'Name: value' or 'Name=value', got a bare value"
+        )
+        info["value_preview"] = mask(value or raw.strip())
+        return info
+
+    info["valid_header"] = True
+    info["name"] = name
+    parts = value.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() in (
+            "bearer", "token", "basic", "apikey", "digest"):
+        info["scheme"] = parts[0]
+        token = parts[1]
+    else:
+        token = value
+    info["value_preview"] = mask(token)
+
+    header_name = name.lower()
+    if header_name == "authorization" and not info["scheme"]:
+        info["notes"].append(
+            "Authorization usually needs a scheme, e.g. 'Authorization: Bearer <token>'"
+        )
+
+    segments = token.split(".")
+    if len(segments) != 3:
+        if len(segments) > 1:
+            info["notes"].append("looks like a JWT but has %d parts, expected 3"
+                                 % len(segments))
+        return info
+
+    info["looks_like_jwt"] = True
+    payload = _b64url_decode(segments[1])
+    if payload is None:
+        info["notes"].append("payload segment is not valid base64url")
+        return info
+    try:
+        claims = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        info["notes"].append("payload is not valid JSON")
+        return info
+    if not isinstance(claims, dict):
+        info["notes"].append("payload is not a JSON object")
+        return info
+
+    info["claims"] = {
+        key: claims[key]
+        for key in ("iss", "sub", "aud", "exp", "iat", "nbf", "scope", "scp")
+        if key in claims
+    }
+    now = int(time.time())
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        info["expired"] = now > exp
+        info["expires_in"] = int(exp) - now
+    else:
+        info["notes"].append("no exp claim; this token may never expire on its own")
+    nbf = claims.get("nbf")
+    if isinstance(nbf, (int, float)) and now < nbf:
+        info["not_yet_valid"] = True
+        info["notes"].append("not valid yet (nbf is in the future)")
+    return info
+
+
+def describe_token(raw: str) -> str:
+    """Human-readable summary for the CLI."""
+    info = inspect_token(raw)
+    lines = []
+    if not info["valid_header"]:
+        lines.append("  header        : INVALID (%s)" % info["notes"][0])
+        return "\n".join(lines)
+
+    lines.append("  header name   : %s" % info["name"])
+    lines.append("  scheme        : %s" % (info["scheme"] or "(none)"))
+    lines.append("  value         : %s" % info["value_preview"])
+    lines.append("  format        : %s"
+                 % ("JWT" if info["looks_like_jwt"] else "opaque"))
+
+    if info["looks_like_jwt"] and info["claims"]:
+        for key, value in info["claims"].items():
+            if key in ("exp", "iat", "nbf"):
+                try:
+                    stamp = datetime.fromtimestamp(int(value), timezone.utc)
+                    rendered = stamp.strftime("%Y-%m-%d %H:%M:%SZ")
+                except (ValueError, OSError, OverflowError):
+                    rendered = str(value)
+                lines.append("  %-13s : %s" % (key, rendered))
+            else:
+                lines.append("  %-13s : %s" % (key, value))
+    if info["expired"] is True:
+        lines.append("  status        : EXPIRED")
+    elif info.get("not_yet_valid"):
+        lines.append("  status        : not valid yet")
+    elif info["expires_in"] is not None:
+        lines.append("  status        : valid, expires in %s"
+                     % _humanize_seconds(info["expires_in"]))
+    for note in info["notes"]:
+        lines.append("  note          : %s" % note)
+    if info["valid_header"] and info["expired"] is not True \
+            and not info.get("not_yet_valid") and info["expires_in"] is None \
+            and info["looks_like_jwt"]:
+        lines.append("  status        : expiry unknown until the server "
+                     "rejects it")
+    lines.append("")
+    lines.append("  This only inspected the token locally. Nothing was sent anywhere.")
+    return "\n".join(lines)
+
+
+def _humanize_seconds(seconds: int) -> str:
+    if seconds < 0:
+        return "already expired"
+    if seconds < 90:
+        return "%d seconds" % seconds
+    if seconds < 5400:
+        return "%d minutes" % (seconds // 60)
+    if seconds < 172800:
+        return "%d hours" % (seconds // 3600)
+    return "%d days" % (seconds // 86400)
 
 
 def describe_auth(config) -> Dict:
