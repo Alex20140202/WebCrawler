@@ -31,10 +31,36 @@ from .parser import (
     registrable_domain,
     word_frequencies,
 )
+from .render import RenderCache, Renderer, playwright_available
+from .routes import discover_routes, hash_variants, route_urls
 from .scanner import scan_page
 from .state import CrawlState, load_state, save_state
 
 Logger = Optional[Callable[[str], None]]
+
+
+def seed_url(raw: str) -> Optional[str]:
+    """Turn user input into a usable http(s) URL, or None."""
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    scheme = candidate.split(":", 1)[0].lower() if ":" in candidate else ""
+    if scheme and not scheme.replace("+", "").replace(".", "").replace("-", "").isalnum():
+        return None
+    if scheme in ("http", "https"):
+        return normalize_url(candidate)
+    if scheme:
+        return None
+    return normalize_url("http://" + candidate)
+
+
+def seeds_first(seeds) -> Optional[str]:
+    """The first usable seed URL, used as a probe target."""
+    for raw in seeds or ():
+        url = seed_url(raw)
+        if url:
+            return url
+    return None
 
 
 class Crawler:
@@ -57,6 +83,11 @@ class Crawler:
         self._sitemap_urls: Set[str] = set()
         self._js_heavy_pages = 0
         self._auth_result = None
+        self._route_report = None
+        self.cache = (None if config.no_render_cache else
+                      RenderCache(config.render_cache or
+                                  os.path.join(config.output_dir, "render-cache")))
+        self.renderer = Renderer(config, cache=self.cache, logger=self.logger)
         self.interactor = interactor or Interactor(
             mode=config.interaction_mode,
             max_questions=config.max_questions,
@@ -73,7 +104,7 @@ class Crawler:
 
     def plan(self) -> Dict:
         """Probe the target and return a crawl plan without fetching pages."""
-        base = self._seed_url(self.config.seeds[0]) if self.config.seeds else None
+        base = seed_url(self.config.seeds[0]) if self.config.seeds else None
         if not base:
             raise ValueError("no valid seed URL")
 
@@ -123,10 +154,13 @@ class Crawler:
         if not resumed:
             self._state.signature = self._signature()
 
-        with Fetcher(self.config, logger=self.logger) as fetcher:
+        with Fetcher(self.config, logger=self.logger,
+                       renderer=self.renderer if self.config.render else None) as fetcher:
             self._authenticate(fetcher)
             if self.config.use_sitemap:
                 self._seed_from_sitemap(fetcher, seeds)
+            if self.config.render:
+                self._seed_from_routes(fetcher)
 
             while self._state.pending and not self._budget_exhausted():
                 batch = self._take_batch()
@@ -194,11 +228,11 @@ class Crawler:
 
     def _signature(self) -> str:
         """Identity of this crawl target, used to validate a resumed state file."""
-        hosts = sorted({u for u in map(self._seed_url, self.config.seeds) if u})
+        hosts = sorted({u for u in map(seed_url, self.config.seeds) if u})
         return "|".join(hosts)
 
     def _seed_from_sitemap(self, fetcher: Fetcher, seeds) -> None:
-        base = self._seed_url(seeds[0][0]) if seeds else None
+        base = seed_url(seeds[0][0]) if seeds else None
         if not base:
             return
 
@@ -254,24 +288,10 @@ class Crawler:
         failures = sum(1 for p in recent if p.get("error"))
         return (failures / float(len(recent))) > self.config.stop_on_error_ratio
 
-    @staticmethod
-    def _seed_url(raw: str) -> Optional[str]:
-        candidate = (raw or "").strip()
-        if not candidate:
-            return None
-        scheme = candidate.split(":", 1)[0].lower() if ":" in candidate else ""
-        if scheme and not scheme.replace("+", "").replace(".", "").replace("-", "").isalnum():
-            return None
-        if scheme in ("http", "https"):
-            return normalize_url(candidate)
-        if scheme:
-            return None
-        return normalize_url("http://" + candidate)
-
     def _prepare_seeds(self) -> List[Tuple[str, int]]:
         prepared = []
         for raw in self.config.seeds:
-            url = self._seed_url(raw)
+            url = seed_url(raw)
             if url is None:
                 self._log("skipping invalid seed: %r" % raw)
                 continue
@@ -324,7 +344,7 @@ class Crawler:
 
     def _host_matches_seeds(self, host: str) -> bool:
         for raw in self.config.seeds or []:
-            url = self._seed_url(raw)
+            url = seed_url(raw)
             if not url:
                 continue
             seed_host = (urlsplit(url).hostname or "").lower()
@@ -419,6 +439,9 @@ class Crawler:
             else links["internal"] + links["external"]
         children = self._filter_children(children)
 
+        if self.config.render and links.get("fragments"):
+            children.extend(self._fragment_urls(url, links["fragments"]))
+
         signals = scan_page(
             html_text, result.url,
             word_count=record.get("word_count", 0),
@@ -450,6 +473,65 @@ class Crawler:
                   % (url, record.get("word_count", 0),
                      len(links["internal"]), len(links["external"])))
         return record, children
+
+    def _seed_from_routes(self, fetcher: Fetcher) -> None:
+        """Queue SPA routes read out of the site's JavaScript.
+
+        Only useful with rendering on: a hash route is the same HTTP resource
+        as the page, so without a browser every one of them would return the
+        identical shell.
+        """
+        if not self.config.extract_routes:
+            return
+        seed = seeds_first(self.config.seeds)
+        if not seed:
+            return
+
+        self._log("reading routes from %s's JavaScript..." % seed)
+
+        def fetch_text(url: str) -> Optional[str]:
+            if self.config.respect_robots and not fetcher.allowed_by_robots(url):
+                return None
+            result = fetcher.get(url, allow_render=False)
+            return result.text if result.ok else None
+
+        report = discover_routes(fetch_text, seed, max_scripts=self.config.max_scripts,
+                                 logger=self._log)
+        self._route_report = report
+        if not report.total:
+            return
+
+        base = seed.rstrip("/")
+        queued = 0
+        for path in [c.path for c in report.static]:
+            url = "%s#%s" % (base, path)
+            if self._in_scope(url.split("#")[0]) and url not in self._state.seen:
+                self._state.push(url, 1)
+                queued += 1
+        self._log("queued %d route url(s) from %d script(s)"
+                  % (queued, len(report.scripts_scanned)))
+
+    def _fragment_urls(self, page_url: str, fragments: List[str]) -> List[str]:
+        """Turn '#/route' links into distinct URLs the renderer can load."""
+        base = page_url.split("#")[0].rstrip("/")
+        out: List[str] = []
+        for fragment in fragments:
+            if not fragment or not fragment.startswith("/"):
+                continue
+            url = "%s#%s" % (base, fragment)
+            if url in out or url in self._state.seen or url in self._seen:
+                continue
+            if not self._in_scope(base):
+                continue
+            if ":" in fragment.split("/")[-1] and not self.config.include_dynamic_routes:
+                # A concrete slug is fine; a bare ':slug' template is not.
+                if re.search(r":[A-Za-z0-9_]+$", fragment):
+                    continue
+            out.append(url)
+        if out:
+            self._drop("fragment_routes", len(out))
+            self._log("  ~ %d hash route(s) to render" % len(out))
+        return out
 
     def _on_nofollow_link(self, url: str) -> None:
         self._drop("nofollow")
@@ -682,6 +764,8 @@ class Crawler:
             "coverage": coverage,
             "agent": self.agent.summary(),
             "auth": self._auth_summary(),
+            "render": self._render_summary(),
+            "routes": self._route_report.as_dict() if self._route_report else None,
             "diagnosis": self._diagnose(pages, seeds),
             "login_walls": sorted({p["url"] for p in pages if p.get("needs_login")}),
             "site": self.probe.as_dict() if self.probe else None,
@@ -699,6 +783,15 @@ class Crawler:
             },
         }
         return {"summary": summary, "pages": pages}
+
+    def _render_summary(self) -> Dict:
+        info = {
+            "enabled": bool(self.config.render),
+            "available": playwright_available(),
+        }
+        if self.config.render:
+            info.update(self.renderer.summary())
+        return info
 
     def _auth_summary(self) -> Dict:
         """Login outcome, with no credentials in it."""

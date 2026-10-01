@@ -103,7 +103,11 @@ def extract_emails(html: str, limit: int = 50) -> List[str]:
 
 def extract_links(html: str, base_url: str, follow_nofollow: bool = False,
                   on_nofollow=None) -> Dict[str, List[str]]:
-    """Split outgoing links into internal, external, and nofollow buckets.
+    """Split outgoing links into internal, external, nofollow and fragment buckets.
+
+    Fragment links (`#/blog`) point at the same HTTP resource as the page, so
+    they are kept verbatim in their own bucket: only a browser can fetch them
+    distinctly, and only if the caller asks for that.
 
     on_nofollow, if given, is called with each nofollow URL so the caller can
     record why those links were not followed.
@@ -112,6 +116,7 @@ def extract_links(html: str, base_url: str, follow_nofollow: bool = False,
     internal: List[str] = []
     external: List[str] = []
     nofollow: List[str] = []
+    fragments: List[str] = []
 
     base_href = None
     base_tag = soup.find("base", href=True)
@@ -122,8 +127,14 @@ def extract_links(html: str, base_url: str, follow_nofollow: bool = False,
     for anchor in soup.find_all("a", href=True):
         rel = anchor.get("rel") or []
         is_nofollow = "nofollow" in [str(r).lower() for r in rel]
-        target = normalize_url(anchor["href"], resolve_from)
+        raw_href = anchor["href"]
+        target = normalize_url(raw_href, resolve_from)
         if target is None:
+            # A hash route collapses to the page itself once normalized, so it
+            # is only recoverable from the raw href.
+            fragment = _fragment_route(raw_href)
+            if fragment and fragment not in fragments:
+                fragments.append(fragment)
             continue
         if is_nofollow and not follow_nofollow:
             if target not in nofollow:
@@ -135,7 +146,18 @@ def extract_links(html: str, base_url: str, follow_nofollow: bool = False,
         if target not in bucket:
             bucket.append(target)
 
-    return {"internal": internal, "external": external, "nofollow": nofollow}
+    return {"internal": internal, "external": external, "nofollow": nofollow,
+            "fragments": fragments}
+
+
+def _fragment_route(href: str) -> Optional[str]:
+    """The path inside a '#/route' fragment, if that is what this is."""
+    if not href or not href.startswith("#"):
+        return None
+    path = href[1:]
+    if not path.startswith("/") or path == "/":
+        return None
+    return path
 
 
 def extract_page(html: str, url: str) -> Dict[str, object]:

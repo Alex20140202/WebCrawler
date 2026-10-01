@@ -10,7 +10,9 @@ from typing import Optional, Sequence
 import os
 
 from supercrawler import PRESETS, get_preset, crawl
-from supercrawler.crawler import Crawler
+from supercrawler.crawler import Crawler, seeds_first
+from supercrawler.fetcher import Fetcher
+from supercrawler.routes import discover_routes
 from supercrawler.wizard import build_plan
 
 
@@ -115,6 +117,31 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--check-auth-header", metavar="'Name: value'",
                       help="inspect an auth header locally (shape, expiry, scopes) "
                            "and exit; the value is never sent anywhere")
+    spa = parser.add_argument_group("JavaScript-rendered sites")
+    spa.add_argument("--render", action="store_true",
+                     help="load pages in a headless browser so JS-built content "
+                          "and links become visible (needs playwright)")
+    spa.add_argument("--render-wait", dest="render_wait_until",
+                     choices=["load", "domcontentloaded", "networkidle", "commit"],
+                     default=None,
+                     help="when to consider a rendered page ready")
+    spa.add_argument("--render-settle", type=int, metavar="MS", default=None,
+                     help="extra milliseconds to wait for late scripts")
+    spa.add_argument("--render-timeout", type=int, metavar="MS", default=None,
+                     help="per-page browser timeout")
+    spa.add_argument("--render-cache", metavar="PATH", default=None,
+                     help="where to keep rendered HTML "
+                          "(default <output>/render-cache)")
+    spa.add_argument("--no-render-cache", action="store_true",
+                     help="re-render every page instead of reusing cached HTML")
+    spa.add_argument("--no-extract-routes", action="store_true",
+                     help="do not read SPA routes out of JavaScript bundles")
+    spa.add_argument("--include-dynamic-routes", action="store_true",
+                     help="also queue route templates such as /blog/:slug")
+    spa.add_argument("--max-scripts", type=int, metavar="N",
+                     help="how many JS files to read for routes")
+    spa.add_argument("--routes-only", action="store_true",
+                     help="print the routes discovered in the JavaScript, then exit")
     return parser
 
 
@@ -162,6 +189,15 @@ def config_from_args(args: argparse.Namespace):
         session_file=(args.session_file or _default_session_file(args.output))
         if (args.session_file or args.login_url) else None,
         require_login=True if args.require_login else None,
+        render=True if args.render else None,
+        render_wait_until=args.render_wait_until,
+        render_settle_ms=args.render_settle,
+        render_timeout=args.render_timeout,
+        render_cache=args.render_cache,
+        no_render_cache=True if args.no_render_cache else None,
+        extract_routes=False if args.no_extract_routes else None,
+        include_dynamic_routes=True if args.include_dynamic_routes else None,
+        max_scripts=args.max_scripts,
     )
 
 
@@ -309,6 +345,34 @@ def run_wizard() -> int:
     return 0
 
 
+def print_routes(report) -> None:
+    data = report.as_dict()
+    print("")
+    print("=" * 58)
+    print("  routes found in JavaScript")
+    print("=" * 58)
+    print("  scripts read    : %d" % data["scripts_scanned"])
+    if data["scripts_failed"]:
+        print("  scripts unreadable: %d" % data["scripts_failed"])
+    print("  static routes   : %d" % data["static_routes"])
+    for path in data["static"]:
+        print("      %s" % path)
+    print("  dynamic routes  : %d" % data["dynamic_routes"])
+    for item in data["dynamic"]:
+        print("      %s   (needs values for: %s)"
+              % (item["path"], ", ".join(item["params"]) or "?"))
+    for note in data["notes"]:
+        print("  note            : %s" % note)
+    if data["dynamic_routes"]:
+        print("")
+        print("  Dynamic routes need real values. Enumerate them from the site's")
+        print("  own API, or add --include-dynamic-routes to queue the templates")
+        print("  (they will render as their not-found page until you do).")
+    print("=" * 58)
+    print("")
+    print("  add --render to crawl these with a real browser")
+
+
 def print_diagnosis(result: dict) -> None:
     """Explain a small or empty crawl in terms of the rule that caused it."""
     diagnosis = (result.get("summary") or {}).get("diagnosis") or {}
@@ -367,6 +431,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: --max-depth must be -1 (unlimited) or >= 0",
               file=sys.stderr)
         return 2
+
+    if args.routes_only:
+        if not config.extract_routes:
+            print("error: --routes-only needs route extraction; drop "
+                  "--no-extract-routes", file=sys.stderr)
+            return 2
+        crawler = Crawler(config, logger=print)
+        base = seeds_first(config.seeds)
+        if not base:
+            print("error: no usable seed URL", file=sys.stderr)
+            return 2
+
+        def fetch_text(url: str):
+            with Fetcher(config, logger=print) as probe:
+                result = probe.get(url)
+            return result.text if result.ok else None
+
+        report = discover_routes(fetch_text, base,
+                                 max_scripts=config.max_scripts, logger=print)
+        print_routes(report)
+        return 0
 
     if args.plan_only:
         if not config.use_sitemap:

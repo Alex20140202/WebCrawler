@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import threading
 import time
 from urllib.parse import urlsplit
@@ -16,6 +17,46 @@ RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 HTML_TYPES = frozenset(
     {"text/html", "application/xhtml+xml", "application/xml", "text/xml"}
 )
+
+# A fetched page with almost no visible text is usually a shell that needs
+# JavaScript. The bar is measured on text with tags removed: counting tokens in
+# raw markup would count every attribute as content and never fire.
+_MIN_VISIBLE_CHARS = 400
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"(?is)<(script|style|noscript)\b.*?</\1>")
+
+# Markers of a page that already has real content.
+_CONTENT_MARKERS = (
+    "<article", "</p>", "</li>", "entry-content", "post-content", "class=\"content",
+)
+
+
+def visible_text_length(html: str) -> int:
+    """Rough count of characters a user would actually see."""
+    if not html:
+        return 0
+    cleaned = _SCRIPT_RE.sub(" ", html)
+    cleaned = _TAG_RE.sub(" ", cleaned)
+    return len(re.sub(r"\s+", " ", cleaned).strip())
+
+
+def _needs_render(result) -> bool:
+    if result.error or not result.ok or not result.is_html:
+        return False
+    lowered = result.text.lower()
+    if any(marker in lowered for marker in _CONTENT_MARKERS):
+        return False
+    return visible_text_length(result.text) < _MIN_VISIBLE_CHARS
+
+
+def _split_auth_header(raw: str):
+    if ":" in raw:
+        name, value = raw.split(":", 1)
+        return name.strip(), value.strip()
+    if "=" in raw:
+        name, value = raw.split("=", 1)
+        return name.strip(), value.strip()
+    return "", ""
 
 
 class FetchResult:
@@ -68,9 +109,10 @@ class Throttle:
 
 
 class Fetcher:
-    def __init__(self, config: CrawlConfig, logger=None):
+    def __init__(self, config: CrawlConfig, logger=None, renderer=None):
         self.config = config
         self.logger = logger
+        self.renderer = renderer
         self.throttle = Throttle(config.per_host_concurrency, config.delay)
         self.session = requests.Session()
         self.session.headers.update({
@@ -104,7 +146,8 @@ class Fetcher:
     def authenticate(self, prompt_code=None) -> LoginResult:
         """Sign in before crawling. Raises AuthError when a login is required."""
         authenticator = Authenticator(self.session, self.config,
-                                      logger=self._log, prompt_code=prompt_code)
+                                      logger=self._log, prompt_code=prompt_code,
+                                      renderer=self.renderer)
 
         reusable = bool(self.config.session_file or self.config.auth_header)
         if not authenticator.enabled:
@@ -172,9 +215,17 @@ class Fetcher:
                 self._robots[root] = parser
             return self._robots[root]
 
-    def get(self, url: str) -> FetchResult:
+    def get(self, url: str, allow_render: bool = True) -> FetchResult:
         if self.config.respect_robots and not self.allowed_by_robots(url):
             return FetchResult(url, error="blocked-by-robots")
+
+        result = self._get_with_retries(url)
+        if (allow_render and self.renderer is not None
+                and _needs_render(result)):
+            return self._render(url, result)
+        return result
+
+    def _get_with_retries(self, url: str) -> FetchResult:
         attempts = max(1, self.config.max_retries + 1)
         for attempt in range(attempts):
             result = self._request(url)
@@ -190,6 +241,32 @@ class Fetcher:
                 continue
             return result
         return FetchResult(url, error="request-failed")
+
+    def _render(self, url: str, shell: FetchResult) -> FetchResult:
+        """A page that came back as an empty shell gets loaded in a browser."""
+        self._log("  rendering %s (server HTML had no content)" % url)
+        extra = {}
+        if self.config.auth_header:
+            name, value = _split_auth_header(self.config.auth_header)
+            if name and value:
+                extra[name] = value
+
+        rendered = self.renderer.render(url, session=self.session,
+                                        extra_headers=extra or None)
+        if not rendered.ok:
+            self._log("  ! render failed: %s" % (rendered.error or "unknown"))
+            rendered.error = None
+            return shell
+
+        elapsed = shell.elapsed + rendered.elapsed
+        return FetchResult(
+            url=rendered.url,
+            status=rendered.status or shell.status,
+            text=rendered.html,
+            content_type="text/html",
+            elapsed=elapsed,
+            error=None,
+        )
 
     def _backoff(self, attempt: int) -> float:
         base = self.config.backoff_factor * (2 ** attempt)

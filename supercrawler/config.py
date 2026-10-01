@@ -55,6 +55,17 @@ class CrawlConfig:
     session_file: str = ""
     require_login: bool = False
 
+    extract_routes: bool = True
+    max_scripts: int = 30
+    include_dynamic_routes: bool = False
+
+    render: bool = False
+    render_wait_until: str = "networkidle"
+    render_settle_ms: int = 400
+    render_timeout: int = 30000
+    render_cache: str = ""
+    no_render_cache: bool = False
+
     def merged(self, **overrides) -> "CrawlConfig":
         applied = {k: v for k, v in overrides.items() if v is not None}
         unknown = set(applied) - {f.name for f in self.__dataclass_fields__.values()}
@@ -80,6 +91,13 @@ class CrawlConfig:
         if self.auth_header and ":" not in self.auth_header \
                 and "=" not in self.auth_header:
             raise ValueError("auth_header must look like 'Name: value' or 'Name=value'")
+        if self.render_wait_until not in ("load", "domcontentloaded", "networkidle",
+                                          "commit"):
+            raise ValueError(
+                "render_wait_until must be load, domcontentloaded, networkidle or commit"
+            )
+        if self.render_settle_ms < 0 or self.render_timeout <= 0:
+            raise ValueError("render_settle_ms must be >= 0 and render_timeout > 0")
 
     @property
     def has_login(self) -> bool:

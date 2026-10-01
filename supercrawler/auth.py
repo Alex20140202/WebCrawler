@@ -313,11 +313,13 @@ class Authenticator:
     """
 
     def __init__(self, session, config, logger: Logger = None,
-                 prompt_code: Optional[Callable[[str], str]] = None):
+                 prompt_code: Optional[Callable[[str], str]] = None,
+                 renderer=None):
         self.session = session
         self.config = config
         self.logger = logger
         self.prompt_code = prompt_code
+        self.renderer = renderer
 
     def _log(self, message: str) -> None:
         if self.logger and getattr(self.config, "verbose", True):
@@ -382,14 +384,15 @@ class Authenticator:
             return LoginResult(False, "form",
                                "could not load login page: %s" % type(exc).__name__)
 
+        form = find_login_form(page.text, page.url)
+        if form is None:
+            # No form in the served HTML: the page builds it with JavaScript, or
+            # submits JSON to an API. Only a browser can complete that login.
+            return self._login_in_browser(url, username, password)
         if has_captcha(page.text):
             self._log("login page has a captcha; refusing to solve it")
             return LoginResult(False, "form", "captcha present", url,
                                needs_captcha=True)
-
-        form = find_login_form(page.text, page.url)
-        if form is None:
-            return LoginResult(False, "form", "no login form found", url)
 
         user_field = pick_field(form["fields"], USERNAME_FIELDS)
         pass_field = pick_field(form["fields"], PASSWORD_FIELDS)
@@ -432,6 +435,54 @@ class Authenticator:
 
         self._log("logged in to %s" % response.url)
         return LoginResult(True, "form", "", response.url)
+
+    def _login_in_browser(self, url: str, username: str,
+                          password: str) -> LoginResult:
+        """Hand the login to a real browser when the served HTML has no form."""
+        if self.renderer is None or not getattr(self.config, "render", False):
+            return LoginResult(False, "form",
+                               "no login form in the served HTML; retry with "
+                               "--render so the browser can fill it", url)
+
+        self._log("login form is built by JavaScript; driving the browser")
+        outcome = self.renderer.login(url, username, password)
+        if not outcome.ok and outcome.needs_totp:
+            code = None
+            if self.prompt_code is not None:
+                try:
+                    code = (self.prompt_code(
+                        "Two-factor code for %s: " % url) or "").strip()
+                except (EOFError, KeyboardInterrupt):
+                    code = ""
+            if code:
+                outcome = self.renderer.login(url, username, password, code)
+
+        if outcome.cookies:
+            for cookie in outcome.cookies:
+                try:
+                    self.session.cookies.set(
+                        cookie.get("name"), cookie.get("value"),
+                        domain=cookie.get("domain", ""),
+                        path=cookie.get("path", "/"),
+                    )
+                except (KeyError, ValueError):
+                    continue
+            self._log("copied %d browser cookie(s) into the HTTP session"
+                      % len(outcome.cookies))
+
+        if not outcome.ok:
+            return LoginResult(False, "browser",
+                               outcome.reason or "browser login failed",
+                               outcome.url or url,
+                               needs_totp=outcome.needs_totp,
+                               needs_captcha=outcome.needs_captcha)
+
+        if self.config.session_file:
+            save_cookies(self.session, self.config.session_file)
+            self._log("saved session to %s" % self.config.session_file)
+
+        self._log("logged in via the browser at %s" % (outcome.url or url))
+        return LoginResult(True, "browser", "", outcome.url or url)
 
     def _handle_second_factor(self, response, url: str) -> LoginResult:
         """Ask the user for their own 2FA code rather than trying to work around it."""
