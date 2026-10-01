@@ -320,20 +320,6 @@ class RendererDegradationTests(unittest.TestCase):
 
 
 class ConfigRenderTests(unittest.TestCase):
-    def test_wait_until_is_validated(self):
-        CrawlConfig(render_wait_until="networkidle").validate()
-        with self.assertRaises(ValueError):
-            CrawlConfig(render_wait_until="whenever").validate()
-
-    def test_settle_and_timeout_bounds(self):
-        CrawlConfig(render_settle_ms=0, render_timeout=1000).validate()
-        with self.assertRaises(ValueError):
-            CrawlConfig(render_settle_ms=-1).validate()
-        with self.assertRaises(ValueError):
-            CrawlConfig(render_timeout=0).validate()
-
-
-class ConfigRenderTests(unittest.TestCase):
     def test_render_defaults_off(self):
         self.assertFalse(CrawlConfig().render)
         self.assertFalse(CrawlConfig().extract_routes)
