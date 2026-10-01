@@ -21,6 +21,57 @@ python3 crawl.py https://example.com --smart
 python3 crawl.py https://example.com --smart --auto
 ```
 
+## Logging in
+
+For sites you own or are authorized to crawl:
+
+```bash
+# password from an environment variable, session reused on later runs
+export SUPERCRAWLER_PASSWORD='...'
+python3 crawl.py https://intranet.example.com/dashboard \
+  --login-url https://intranet.example.com/login -u alice --require-login
+
+# a token header instead of a form (API docs, CI systems)
+python3 crawl.py https://api.example.com \
+  --auth-header 'Authorization: Bearer ghp_xxx'
+```
+
+Login happens once, before any content request, on the same session the crawl
+then uses. The authenticator:
+
+- finds the login form by looking for a password field, scoring candidates so a
+  search box is never mistaken for it
+- picks the username and password field names rather than hardcoding them
+- replays the form's hidden inputs, so CSRF tokens (`csrfmiddlewaretoken`,
+  `authenticity_token`, and friends) are carried over
+- confirms the login actually worked by checking it is no longer on a login form
+  and that no failure text came back, so it never proceeds silently as anonymous
+- accepts `--session-file` to save cookies and skip the form on later runs
+
+### Two-factor
+
+If the site asks for a code, the crawler stops and asks you for it rather than
+trying to get around it. With `--ask` it prompts; with `--auto` it reports
+`needs_totp` and continues without a session. A captcha page is detected and
+refused outright — it will not attempt to solve one.
+
+### Credential handling
+
+- the password is read from `--password-env` (default `SUPERCRAWLER_PASSWORD`),
+  so it stays out of shell history and process listings
+- `--password` exists but is discouraged; the two together are rejected as a
+  likely mistake
+- the password never appears in logs, reports, or `AuthError` messages; log lines
+  are redacted on the way out as a second line of defence
+- `session.json` is written with `0600` permissions and is gitignored
+- `--require-login` aborts rather than crawling anonymously if login fails
+
+### What login does not do
+
+It does not guess or brute-force credentials, solve captchas, bypass 2FA, or use
+any session other than the one the site issued in response to your own login.
+Login-walled pages discovered mid-crawl are listed in the report and skipped.
+
 ## Three modes
 
 | flag | behaviour |
@@ -57,9 +108,13 @@ re-fetches page 1. Pager links are tried in order until one actually reveals a
 pattern, since the first one is usually "page 1".
 
 **Every action is read-only.** It only ever queues URLs to fetch. It does not
-submit POST forms, does not sign in, and does not attempt to work around access
-controls. A GET search box is the one form it will use, and only with terms you
-gave it. `--no-auto-actions` turns the whole layer off.
+submit POST forms and does not work around access controls. A GET search box is
+the one form it will use, and only with terms you gave it. `--no-auto-actions`
+turns the whole layer off.
+
+Signing in is separate and happens once up front; see *Logging in* below. A page
+the scanner spots as gated is reported and skipped, never used as a route into
+the private area unless you logged in deliberately.
 
 Caps you can set: `--max-actions-per-page` (default 25 URLs added per page),
 `--max-questions` (default 10 per run).
@@ -142,6 +197,7 @@ Written to `-o/--output` (default `output/`):
   breakdowns, crawler actions, login-walled pages, emails, page table
 - `crawl-state.json` — resume state
 - `decisions.json` — every question asked and what was decided
+- `session.json` — saved cookies (gitignored, mode 0600) when you log in
 
 Per page: status, content type, title and length, meta description, keywords,
 canonical, lang, headings, word count, text preview, top terms, link counts,
@@ -207,7 +263,7 @@ On by default, and worth keeping on:
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 99 tests, local fixture server
+python3 -m unittest discover -s tests -v   # 130 tests, local fixture server
 python3 tests/smoke_cli.py                 # end-to-end CLI check
 ```
 
@@ -215,7 +271,8 @@ Both run against a throwaway `http.server` fixture on localhost, so they never
 touch the network. The fixture serves a sitemap index, a page sitemap, an orphan
 page reachable only via sitemap, a robots-blocked path, a non-HTML file, a
 JavaScript shell, a paginated blog, a login wall with a secret page behind it,
-and pages at several depths.
+pages at several depths, and a login area with a CSRF token, a wrong-password
+error path, a captcha variant, and a two-factor step.
 
 ## Layout
 
@@ -224,6 +281,7 @@ crawl.py                  CLI entry point
 supercrawler/config.py    CrawlConfig dataclass and presets
 supercrawler/discovery.py sitemap probing, URL policy, size estimation
 supercrawler/scanner.py   DOM scanning: pagers, feeds, forms, walls
+supercrawler/auth.py      login form handling, CSRF, 2FA, session reuse
 supercrawler/agent.py     turns signals into queued URLs, read-only
 supercrawler/interact.py  when to ask, when to decide alone
 supercrawler/fetcher.py   HTTP: throttling, robots, retries, byte limits
@@ -239,8 +297,10 @@ tests/                    unit tests and CLI smoke test
 
 - `html.parser` only, so it reads server-rendered HTML. JavaScript-rendered pages
   are detected and flagged, not rendered. Adding `playwright` would fix that.
-- It will not sign in or submit POST forms, so anything behind a login is listed
-  as a wall and left alone. That is deliberate, not an oversight.
+- Login covers ordinary HTML forms with a password field. Sites that authenticate
+  through a JS-driven flow or an OAuth redirect need the cookie/header path
+  (`--session-file` or `--auth-header`) instead.
+- It will not solve a captcha, and it will not bypass 2FA; both are reported.
 - "Load more" endpoints are reported but not fetched; they need a JSON parser.
 - No sitemap and no links means no pages; that is inherent, not a bug.
 - `robots.txt` is parsed by the standard library, which does not implement every

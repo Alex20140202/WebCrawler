@@ -143,9 +143,15 @@ def scan_page(html: str, url: str, word_count: int = 0, link_count: int = 0) -> 
             if href not in signals.feed_urls:
                 signals.feed_urls.append(href)
 
-    # Login walls: a password field, or a form pointing at a sign-in page.
+    # Password field or sign-in wording. Login itself is handled once up front
+    # by the authenticator; here we only note that the page is gated so the
+    # crawler does not treat its links as freely reachable content.
     if soup.find("input", {"type": "password"}):
         signals.needs_login = True
+    if soup.find("form", {"action": re.compile(r"(login|signin|sign-in|auth)",
+                                               re.IGNORECASE)}):
+        if soup.find("input", {"type": "password"}):
+            signals.needs_login = True
 
     for anchor in soup.find_all("a", href=True):
         text = anchor.get_text(" ", strip=True)

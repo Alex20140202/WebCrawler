@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -116,6 +117,48 @@ MEMBERS_SECRET = """<html><head><title>Secret</title></head><body>
 <h1>Secret</h1><p>Only reachable by following a link out of the login wall.</p>
 </body></html>"""
 
+# --- authenticated area fixtures -------------------------------------------
+
+LOGIN_PAGE = """<html><head><title>Sign in</title></head><body>
+<h1>Sign in</h1>
+%(error)s
+<form action="%(action)s" method="post" class="login-form">
+  <input type="hidden" name="csrfmiddlewaretoken" value="tok-abc-123">
+  <input type="hidden" name="next" value="/dashboard">
+  <input type="text" name="username">
+  <input type="password" name="password">
+  <input type="submit" value="Sign in">
+</form>
+</body></html>"""
+
+TOTP_PAGE = """<html><head><title>Two-factor</title></head><body>
+<h1>Two-factor</h1>
+<form action="/2fa" method="post">
+  <input type="hidden" name="csrfmiddlewaretoken" value="tok-2fa">
+  <input type="text" name="otp" placeholder="Verification code">
+  <input type="submit" value="Verify">
+</form>
+</body></html>"""
+
+CAPTCHA_PAGE = """<html><head><title>Sign in</title></head><body>
+<form action="/login" method="post">
+  <input type="text" name="username"><input type="password" name="password">
+  <div class="g-recaptcha" data-sitekey="abc"></div>
+</form>
+</body></html>"""
+
+DASHBOARD = """<html><head><title>Dashboard</title></head><body>
+<h1>Dashboard</h1><p>Private overview with enough words to survive content dedupe.</p>
+<a href="/reports.html">Reports</a></body></html>"""
+
+REPORTS = """<html><head><title>Reports</title></head><body>
+<h1>Reports</h1><p>Private report listing, distinct from the dashboard copy above.</p>
+</body></html>"""
+
+OK_USER = "scout"
+OK_PASS = "correct-horse"
+TOTP_CODE = "424242"
+
 SPA_PAGE = """<html><head><title>SPA shell</title></head><body>
 <div id="root"></div>
 <script src="/app.js"></script><script src="/vendor.js"></script>
@@ -125,17 +168,75 @@ SPA_PAGE = """<html><head><title>SPA shell</title></head><body>
 
 class Handler(BaseHTTPRequestHandler):
     port = 0
+    session = set()
 
     def log_message(self, *args):
         pass
 
-    def _respond(self, status, body, content_type="text/html; charset=utf-8"):
+    def _session_ok(self) -> bool:
+        raw = self.headers.get("Cookie") or ""
+        return any(part.strip().endswith("sid=%s" % self.server.session_id)
+                   for part in raw.split(";"))
+
+    def _respond(self, status, body, content_type="text/html; charset=utf-8",
+                 headers=None):
         raw = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in (headers or []):
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
+
+    def _read_post(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        pairs = []
+        for chunk in body.split("&"):
+            if not chunk:
+                continue
+            name, _, value = chunk.partition("=")
+            pairs.append((name.replace("+", " "), value.replace("+", " ")))
+        return dict(pairs)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        form = self._read_post()
+
+        if path == "/login" or path == "/login-totp":
+            if form.get("username") == OK_USER and form.get("password") == OK_PASS:
+                if form.get("csrfmiddlewaretoken") != "tok-abc-123":
+                    self._respond(200, LOGIN_PAGE % {"error":
+                                 "<p>CSRF token missing</p>",
+                                 "action": self.path})
+                    return
+                target = "/2fa" if path == "/login-totp" else "/dashboard"
+                self.send_response(302)
+                self.send_header("Location", target)
+                if path != "/login-totp":
+                    self.send_header("Set-Cookie",
+                                     "sid=%s; Path=/" % self.server.session_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._respond(200, LOGIN_PAGE % {
+                "error": "<p>Invalid username or password.</p>",
+                "action": self.path})
+            return
+
+        if path == "/2fa":
+            if form.get("otp") == TOTP_CODE:
+                self.send_response(302)
+                self.send_header("Location", "/dashboard")
+                self.send_header("Set-Cookie", "sid=%s; Path=/" % self.server.session_id)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._respond(200, TOTP_PAGE)
+            return
+
+        self._respond(404, NOTFOUND)
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -160,6 +261,22 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, MEMBERS)
         elif path == "/members-secret.html":
             self._respond(200, MEMBERS_SECRET)
+        elif path == "/login":
+            self._respond(200, LOGIN_PAGE % {"error": "", "action": "/login"})
+        elif path == "/login-totp":
+            self._respond(200, LOGIN_PAGE % {"error": "", "action": "/login-totp"})
+        elif path == "/captcha-login":
+            self._respond(200, CAPTCHA_PAGE)
+        elif path == "/2fa":
+            self._respond(200, TOTP_PAGE)
+        elif path in ("/dashboard", "/reports.html"):
+            if not self._session_ok():
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._respond(200, DASHBOARD if path == "/dashboard" else REPORTS)
         elif path == "/spa.html":
             self._respond(200, SPA_PAGE)
         elif path in ("/", "/index.html"):
@@ -191,6 +308,9 @@ class Handler(BaseHTTPRequestHandler):
 class LocalSite:
     def __init__(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.session_id = hashlib.sha1(
+            str(self.server.server_address[1]).encode()
+        ).hexdigest()[:12]
         self.port = self.server.server_address[1]
         Handler.port = self.port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

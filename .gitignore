@@ -8,3 +8,8 @@ output/
 .venv/
 .DS_Store
 .idea/
+
+# Holds live auth cookies. Never commit this.
+session.json
+*.session.json
+.env

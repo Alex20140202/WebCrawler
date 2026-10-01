@@ -9,6 +9,7 @@ from urllib.robotparser import RobotFileParser
 import requests
 from requests.adapters import HTTPAdapter
 
+from .auth import AuthError, Authenticator, LoginResult
 from .config import CrawlConfig
 
 RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -67,8 +68,9 @@ class Throttle:
 
 
 class Fetcher:
-    def __init__(self, config: CrawlConfig):
+    def __init__(self, config: CrawlConfig, logger=None):
         self.config = config
+        self.logger = logger
         self.throttle = Throttle(config.per_host_concurrency, config.delay)
         self.session = requests.Session()
         self.session.headers.update({
@@ -82,6 +84,12 @@ class Fetcher:
         self.session.mount("https://", adapter)
         self._robots = {}
         self._robots_lock = threading.Lock()
+        self.auth_result = None
+        self.auth_info = {}
+
+    def _log(self, message: str) -> None:
+        if self.logger and self.config.verbose:
+            self.logger(message)
 
     def close(self) -> None:
         self.session.close()
@@ -92,6 +100,39 @@ class Fetcher:
     def __exit__(self, *exc):
         self.close()
         return False
+
+    def authenticate(self, prompt_code=None) -> LoginResult:
+        """Sign in before crawling. Raises AuthError when a login is required."""
+        authenticator = Authenticator(self.session, self.config,
+                                      logger=self._log, prompt_code=prompt_code)
+
+        reusable = bool(self.config.session_file or self.config.auth_header)
+        if not authenticator.enabled:
+            if not reusable:
+                return LoginResult(True, "none", "no login configured")
+            # No credentials to post, but a saved session or auth header still
+            # needs applying before the first content request.
+            self.auth_info = authenticator.prepare()
+            self.auth_result = LoginResult(True, "session",
+                                           "using saved session or auth header")
+            return self.auth_result
+
+        self.auth_info = authenticator.prepare()
+
+        if self.config.login_url:
+            # The login page is a credential POST, not a crawl of public
+            # content, so the robots check for content URLs does not apply.
+            self._log("authenticating at %s" % self.config.login_url)
+            result = authenticator.login()
+            self.auth_result = result
+            if not result.ok and self.config.require_login:
+                raise AuthError(result.reason or "login failed")
+            if not result.ok:
+                self._log("continuing without a session; protected pages will 403")
+            return result
+
+        self.auth_result = LoginResult(True, "session", "using saved session")
+        return self.auth_result
 
     def allowed_by_robots(self, url: str) -> bool:
         if not self.config.respect_robots:

@@ -14,13 +14,14 @@ sys.path.insert(0, ROOT)
 from http.server import ThreadingHTTPServer
 
 from crawl import main
-from test_crawler import Handler
+from test_crawler import OK_PASS, OK_USER, Handler
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smoke_output")
 shutil.rmtree(out, ignore_errors=True)
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 Handler.port = server.server_address[1]
+server.session_id = "smokesession"
 threading.Thread(target=server.serve_forever, daemon=True).start()
 base = "http://127.0.0.1:%d" % Handler.port
 
@@ -123,6 +124,77 @@ code = main([base + "/", "--max-pages", "-5"])
 print("  exit code (expected 2): %d" % code)
 assert code == 2
 
+print("\n### anonymous crawl cannot see protected pages")
+out8 = out + "_anon"
+shutil.rmtree(out8, ignore_errors=True)
+code = main([base + "/dashboard", "--no-sitemap", "-d", "127.0.0.1", "-o", out8])
+assert code == 0
+with open(os.path.join(out8, "report.json"), encoding="utf-8") as handle:
+    anon = json.load(handle)
+anon_titles = [p.get("title") for p in anon["pages"]]
+print("  anonymous saw: %s" % anon_titles)
+assert "Dashboard" not in anon_titles, "protected page leaked to anonymous crawl"
+
+print("\n### --login-url signs in and reaches protected pages")
+out9 = out + "_login"
+shutil.rmtree(out9, ignore_errors=True)
+os.environ["SMOKE_PW"] = OK_PASS
+try:
+    code = main([base + "/dashboard", "--no-sitemap", "-d", "127.0.0.1",
+                 "--login-url", base + "/login", "-u", OK_USER,
+                 "--password-env", "SMOKE_PW", "--require-login", "-o", out9])
+    assert code == 0, "login crawl failed"
+finally:
+    del os.environ["SMOKE_PW"]
+
+with open(os.path.join(out9, "report.json"), encoding="utf-8") as handle:
+    logged = json.load(handle)
+logged_titles = [p.get("title") for p in logged["pages"]]
+print("  authenticated saw: %s" % logged_titles)
+assert "Dashboard" in logged_titles, "login did not unlock the protected page"
+assert "Reports" in logged_titles, "linked protected page not crawled"
+assert logged["summary"]["auth"]["ok"] is True
+session_path = os.path.join(out9, "session.json")
+print("  session file: %s (mode %o)" % (os.path.exists(session_path),
+                                         os.stat(session_path).st_mode & 0o777))
+assert os.path.exists(session_path)
+assert os.stat(session_path).st_mode & 0o777 == 0o600
+
+print("\n### password never lands in the report")
+blob = open(os.path.join(out9, "report.json"), encoding="utf-8").read()
+print("  password present in report.json: %s" % (OK_PASS in blob))
+assert OK_PASS not in blob
+
+print("\n### --require-login aborts on bad credentials")
+out10 = out + "_badlogin"
+shutil.rmtree(out10, ignore_errors=True)
+os.environ["SMOKE_BAD"] = "wrong-password"
+try:
+    code = main([base + "/dashboard", "--no-sitemap", "-d", "127.0.0.1",
+                 "--login-url", base + "/login", "-u", OK_USER,
+                 "--password-env", "SMOKE_BAD", "--require-login", "-o", out10])
+finally:
+    del os.environ["SMOKE_BAD"]
+print("  exit code (expected 1): %d" % code)
+assert code == 1
+
+print("\n### saved session is reused without credentials")
+out11 = out + "_reuse"
+shutil.rmtree(out11, ignore_errors=True)
+code = main([base + "/reports.html", "--no-sitemap", "-d", "127.0.0.1",
+             "--session-file", session_path, "--require-login", "-o", out11])
+assert code == 0, "session reuse failed"
+with open(os.path.join(out11, "report.json"), encoding="utf-8") as handle:
+    reused = json.load(handle)
+print("  reused session, saw: %s" % [p.get("title") for p in reused["pages"]])
+assert reused["summary"]["auth"]["ok"] is True
+
+print("\n### login status in the HTML report")
+report_html = open(os.path.join(out9, "report.html"), encoding="utf-8").read()
+print("  html has login section: %s" % ("<h2>Login</h2>" in report_html))
+assert "<h2>Login</h2>" in report_html
+assert OK_PASS not in report_html
+
 print("\n### no seeds rejected")
 try:
     code = main(["--smart"])
@@ -135,6 +207,7 @@ except SystemExit as exc:
 server.shutdown()
 server.server_close()
 
-for d in (out, out2, out3, out + "_bad"):
+for d in (out, out2, out3, out + "_bad", out6, out7, out8, out9,
+          out10, out11, out4, out5):
     shutil.rmtree(d, ignore_errors=True)
 print("\nALL CLI SMOKE CHECKS PASSED")

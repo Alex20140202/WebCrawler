@@ -193,12 +193,13 @@ class Agent:
                             % (len(terms), len(finding.meta.get("forms", []))))
 
     def _on_login(self, finding: Finding) -> ActionResult:
-        """Never attempt to authenticate; just record the wall."""
-        self._log("  ! %s needs a login; skipping (this crawler does not sign in)"
+        """Never try to authenticate: record the wall and let the crawler skip it."""
+        self._log("  ! %s needs a login; not following it into the gated area"
                   % finding.url)
         self.interactor.get(
             "login_walls",
-            "Some pages need a login. I will not sign in; continue past them?",
+            "Some pages need a login. This crawler will not sign in; "
+            "continue past them?",
             True,
             "%s appears gated" % finding.url,
         )

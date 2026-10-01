@@ -1,5 +1,6 @@
 from .config import PRESETS, CrawlConfig, get_preset
 from .agent import ACTION_FEED, ACTION_LOGIN, ACTION_NEXT, ACTION_PAGINATE, Agent
+from .auth import AuthError, Authenticator, LoginResult, describe_auth
 from .crawler import Crawler, crawl
 from .discovery import (
     SiteProbe,
@@ -29,7 +30,7 @@ from .scanner import Finding, PageSignals, build_paged_urls, expand_search_form,
 from .state import CrawlState, load_state, save_state
 from .wizard import build_plan
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 
 __all__ = [
     "CrawlConfig",
@@ -59,6 +60,10 @@ __all__ = [
     "Finding",
     "build_paged_urls",
     "expand_search_form",
+    "Authenticator",
+    "LoginResult",
+    "AuthError",
+    "describe_auth",
     "CrawlState",
     "save_state",
     "load_state",

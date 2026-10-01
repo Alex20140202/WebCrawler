@@ -206,11 +206,32 @@ def write_html(path: str, pages: Sequence[Dict], summary: Optional[Dict] = None)
     if walls:
         wall_html = (
             '<h2>Pages needing a login (%d)</h2><div class="panel">'
-            '<p class="muted">Not fetched. This crawler does not sign in.</p>%s</div>'
+            '<p class="muted">Not fetched.</p>%s</div>'
             % (len(walls), "".join(
                 '<div><a href="%s" target="_blank" rel="noopener noreferrer">%s</a></div>'
                 % (esc(w), esc(w)) for w in walls[:50]))
         )
+
+    auth = summary.get("auth") or {}
+    auth_html = ""
+    if auth.get("login_configured") or auth.get("auth_header"):
+        if auth.get("attempted"):
+            badge = "ok" if auth.get("ok") else "err"
+            detail = esc(auth.get("reason") or "")
+            auth_html = (
+                '<h2>Login</h2><div class="panel">'
+                '<p><span class="badge %s">%s</span> %s as <b>%s</b>'
+                ' · method: %s</p>%s'
+                '<p class="muted">No credentials are stored in this report.</p></div>'
+                % (badge, esc(auth.get("method", "?")),
+                   "signed in" if auth.get("ok") else "failed",
+                   esc(auth.get("username", "") or "-"),
+                   esc(auth.get("method", "")),
+                   ('<p class="muted">%s</p>' % detail) if detail else "")
+            )
+        else:
+            auth_html = ('<h2>Login</h2><div class="panel">'
+                         '<p class="muted">Configured but not attempted.</p></div>')
 
     document = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -252,7 +273,7 @@ a:hover { text-decoration:underline; }
 <h2>Top hosts</h2><div class="panel">%(domains)s</div>
 <h2>Pages by depth</h2><div class="panel">%(depths)s</div>
 <h2>Emails (%(email_count)d)</h2><div class="panel emailbox">%(emails)s</div>
-%(agent)s%(walls)s
+%(agent)s%(walls)s%(auth)s
 <h2>Pages (%(page_count)d)</h2>
 <table><thead><tr><th>URL</th><th>Depth</th><th>Status</th><th>Title</th>
 <th>Words</th><th>Meta</th><th>Links</th></tr></thead><tbody>%(rows)s</tbody></table>
@@ -268,6 +289,7 @@ a:hover { text-decoration:underline; }
         "emails": email_html,
         "agent": agent_html,
         "walls": wall_html,
+        "auth": auth_html,
         "email_count": len(emails),
         "page_count": len(pages),
         "rows": rows_html,

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from .config import CrawlConfig
 from .agent import Agent
+from .auth import describe_auth
 from .discovery import (
     estimate_from_links,
     is_crawlable_url,
@@ -54,6 +55,7 @@ class Crawler:
         self.total_known = 0
         self._sitemap_urls: Set[str] = set()
         self._js_heavy_pages = 0
+        self._auth_result = None
         self.interactor = interactor or Interactor(
             mode=config.interaction_mode,
             max_questions=config.max_questions,
@@ -120,7 +122,8 @@ class Crawler:
         if not resumed:
             self._state.signature = self._signature()
 
-        with Fetcher(self.config) as fetcher:
+        with Fetcher(self.config, logger=self.logger) as fetcher:
+            self._authenticate(fetcher)
             if self.config.use_sitemap:
                 self._seed_from_sitemap(fetcher, seeds)
 
@@ -158,6 +161,19 @@ class Crawler:
         if self.config.decisions_file:
             self.interactor.save(self.config.decisions_file)
         return result
+
+    def _authenticate(self, fetcher: Fetcher) -> None:
+        """Sign in once, before any content request, if configured to."""
+        if not self.config.has_login:
+            return
+        result = fetcher.authenticate(prompt_code=self._prompt_2fa)
+        self._auth_result = result
+        self._log("auth: %s (%s)" % ("ok" if result.ok else "failed", result.method))
+
+    def _prompt_2fa(self, message: str) -> str:
+        """Ask for a 2FA code through the interactor, respecting ask/auto/never."""
+        answer = self.interactor.get("totp_code", message.strip(), "", "")
+        return str(answer.value or "")
 
     def _resume_if_possible(self) -> bool:
         if not self.config.state_file:
@@ -532,6 +548,7 @@ class Crawler:
             "pending": len(self._state.pending),
             "coverage": coverage,
             "agent": self.agent.summary(),
+            "auth": self._auth_summary(),
             "login_walls": sorted({p["url"] for p in pages if p.get("needs_login")}),
             "site": self.probe.as_dict() if self.probe else None,
             "config": {
@@ -548,6 +565,20 @@ class Crawler:
             },
         }
         return {"summary": summary, "pages": pages}
+
+    def _auth_summary(self) -> Dict:
+        """Login outcome, with no credentials in it."""
+        info = describe_auth(self.config)
+        if self._auth_result is not None:
+            info["attempted"] = True
+            info["ok"] = self._auth_result.ok
+            info["method"] = self._auth_result.method
+            info["reason"] = self._auth_result.reason
+            info["needs_totp"] = self._auth_result.needs_totp
+            info["needs_captcha"] = self._auth_result.needs_captcha
+        else:
+            info["attempted"] = False
+        return info
 
 
 def crawl(config: CrawlConfig, logger: Logger = None, output_dir: Optional[str] = None) -> Dict:

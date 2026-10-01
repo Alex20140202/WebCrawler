@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Sequence
 
@@ -46,6 +47,14 @@ class CrawlConfig:
     max_actions_per_page: int = 25
     decisions_file: str = ""
 
+    login_url: str = ""
+    login_username: str = ""
+    login_password: str = ""
+    login_password_env: str = "SUPERCRAWLER_PASSWORD"
+    auth_header: str = ""
+    session_file: str = ""
+    require_login: bool = False
+
     def merged(self, **overrides) -> "CrawlConfig":
         applied = {k: v for k, v in overrides.items() if v is not None}
         unknown = set(applied) - {f.name for f in self.__dataclass_fields__.values()}
@@ -68,6 +77,19 @@ class CrawlConfig:
             raise ValueError("max_questions cannot be negative")
         if self.max_actions_per_page < 0:
             raise ValueError("max_actions_per_page cannot be negative")
+        if self.login_url and self.login_password and self.login_password_env:
+            if self.login_password_env and os.environ.get(self.login_password_env):
+                raise ValueError(
+                    "set the password either inline or via %s, not both"
+                    % self.login_password_env
+                )
+        if self.auth_header and ":" not in self.auth_header \
+                and "=" not in self.auth_header:
+            raise ValueError("auth_header must look like 'Name: value' or 'Name=value'")
+
+    @property
+    def has_login(self) -> bool:
+        return bool(self.login_url or self.auth_header or self.session_file)
 
     @property
     def unlimited_depth(self) -> bool:

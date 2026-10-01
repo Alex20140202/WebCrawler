@@ -91,6 +91,24 @@ def build_parser() -> argparse.ArgumentParser:
                              help="cap URLs added per page by the agent")
     agent_group.add_argument("--decisions-file",
                              help="save/load answered decisions (JSON)")
+
+    auth = parser.add_argument_group("login (for sites you are authorized to use)")
+    auth.add_argument("--login-url", metavar="URL",
+                      help="sign in via this form before crawling")
+    auth.add_argument("-u", "--username", metavar="NAME",
+                      help="login username")
+    auth.add_argument("--password-env", metavar="VAR", default=None,
+                      help="environment variable holding the password "
+                           "(default SUPERCRAWLER_PASSWORD)")
+    auth.add_argument("--password", metavar="VALUE",
+                      help="password inline (discouraged: use --password-env, "
+                           "it keeps the value out of your shell history)")
+    auth.add_argument("--auth-header", metavar="'Name: value'",
+                      help="send a fixed header, e.g. 'Authorization: Bearer ...'")
+    auth.add_argument("--session-file", metavar="PATH",
+                      help="save/reuse cookies so repeat runs skip the login form")
+    auth.add_argument("--require-login", action="store_true",
+                      help="abort instead of crawling anonymously if login fails")
     return parser
 
 
@@ -130,11 +148,23 @@ def config_from_args(args: argparse.Namespace):
         auto_actions=False if args.no_auto_actions else None,
         max_actions_per_page=args.max_actions_per_page,
         decisions_file=args.decisions_file or _default_decisions_file(args.output),
+        login_url=args.login_url,
+        login_username=args.username,
+        login_password=args.password,
+        login_password_env=args.password_env,
+        auth_header=args.auth_header,
+        session_file=(args.session_file or _default_session_file(args.output))
+        if (args.session_file or args.login_url) else None,
+        require_login=True if args.require_login else None,
     )
 
 
 def _default_decisions_file(output_dir: str) -> str:
     return os.path.join(output_dir, "decisions.json")
+
+
+def _default_session_file(output_dir: str) -> str:
+    return os.path.join(output_dir, "session.json")
 
 
 def _default_state_file(output_dir: str) -> str:
@@ -187,6 +217,15 @@ def print_summary(result: dict) -> None:
     if summary.get("login_walls"):
         lines.append("  login-walled    : %d page(s) skipped"
                      % len(summary["login_walls"]))
+
+    auth = summary.get("auth") or {}
+    if auth.get("attempted"):
+        lines.append("  login          : %s via %s"
+                     % ("ok" if auth.get("ok") else "FAILED", auth.get("method")))
+        if auth.get("reason"):
+            lines.append("  login reason   : %s" % auth["reason"])
+    elif auth.get("login_configured") or auth.get("auth_header"):
+        lines.append("  login          : not attempted")
     problems = [p for p in result["pages"] if p.get("error")][:10]
     if problems:
         lines.append("")
