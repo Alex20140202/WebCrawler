@@ -220,6 +220,13 @@ def print_summary(result: dict) -> None:
         "=" * 58,
         "  crawl finished in %0.2fs" % summary["elapsed"],
         "=" * 58,
+    ]
+    diagnosis = summary.get("diagnosis") or {}
+    if summary.get("resumed"):
+        lines.append("  resumed run    : %d page(s) were already crawled by an "
+                     "earlier run"
+                     % diagnosis.get("already_crawled_before_this_run", 0))
+    lines += [
         "  pages crawled   : %d" % summary["pages_crawled"],
         "  successful      : %d" % summary["successful"],
         "  failed          : %d" % summary["failed"],

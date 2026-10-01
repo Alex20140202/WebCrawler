@@ -520,6 +520,39 @@ class DiagnosisTests(unittest.TestCase):
         examples = result["summary"]["diagnosis"]["dropped_examples"]
         self.assertTrue(any("f1.pdf" in u for u in examples["asset_or_admin_path"]))
 
+    def test_resumed_complete_run_is_explained(self):
+        """A finished crawl re-run must not claim the seeds were unfetchable."""
+        with LocalSite() as site, tempfile.TemporaryDirectory() as tmp:
+            state_path = os.path.join(tmp, "state.json")
+            config = CrawlConfig(seeds=[site.base + "/"], delay=0.0,
+                                 use_sitemap=False, state_file=state_path)
+            first = crawl(config, logger=None)
+            self.assertGreater(first["summary"]["pages_crawled"], 0)
+
+            second = crawl(config, logger=None)
+        summary = second["summary"]
+        diagnosis = summary["diagnosis"]
+        self.assertTrue(summary["resumed"])
+        self.assertEqual(summary["pages_crawled"], 0,
+                         "everything was already crawled")
+        reasons = {r["reason"] for r in diagnosis["reasons"]}
+        self.assertIn("already_complete", reasons)
+        self.assertNotIn("no_pages", reasons)
+        self.assertEqual(diagnosis["already_crawled_before_this_run"],
+                         first["summary"]["pages_crawled"])
+        self.assertTrue(any("--no-resume" in s for s in diagnosis["suggestions"]))
+
+    def test_unfetchable_seeds_still_report_no_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = CrawlConfig(seeds=["http://127.0.0.1:9/"], delay=0.0,
+                                 use_sitemap=False, verbose=False,
+                                 state_file=os.path.join(tmp, "s.json"),
+                                 max_retries=0)
+            result = crawl(config, logger=None)
+        reasons = {r["reason"] for r in result["summary"]["diagnosis"]["reasons"]}
+        self.assertIn("no_pages", reasons)
+        self.assertFalse(result["summary"]["resumed"])
+
     def test_cli_prints_diagnosis_for_a_one_page_crawl(self):
         import crawl as cli
         html = "<html><body><div id=root></div></body></html>"

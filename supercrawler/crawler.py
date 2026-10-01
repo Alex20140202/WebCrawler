@@ -576,7 +576,7 @@ class Crawler:
         if len(bucket) < cap:
             bucket.append(url)
 
-    def _diagnose(self, pages: List[Dict], seeds) -> Dict:
+    def _diagnose(self, pages: List[Dict], seeds, resumed: bool = False) -> Dict:
         """Explain why the crawl reached the pages it did.
 
         Every reason a candidate URL was discarded is counted, so a crawl that
@@ -625,10 +625,32 @@ class Crawler:
             reasons.append(("page_budget", self.config.max_pages,
                             "hit --max-pages; raise it or use 0 for unlimited"))
 
-        if not pages:
-            reasons.append(("no_pages", 0, "the seed pages could not be fetched"))
+        prior_work = self._state.pages_crawled if resumed else 0
+        nothing_to_do = bool(resumed and prior_work and not pages)
+        if nothing_to_do:
+            reasons.append(("already_complete", prior_work,
+                            "the saved state already had %d page(s) crawled "
+                            "and nothing left queued, so this run had "
+                            "nothing to do" % prior_work))
+        elif not reachable:
+            reasons.append(("no_pages", len(pages),
+                            ("nothing could be fetched: %d attempt(s) all failed"
+                             % len(pages)) if pages else
+                            "no seed page could be fetched"))
 
         suggestions = []
+        if nothing_to_do:
+            state_path = self.config.state_file or "the state file"
+            suggestions.append(
+                "Nothing was crawled because an earlier run had already "
+                "finished %s. Re-run with --no-resume to crawl it again, or "
+                "delete %s to start from scratch." % (state_path, state_path)
+            )
+        if pages and not reachable:
+            suggestions.append(
+                "Every request failed. Check the URL, your network, and "
+                "whether the host needs --login-url or --ignore-robots."
+            )
         if links_seen == 0 and reachable:
             suggestions.append(
                 "No server-side links were found. The site almost certainly "
@@ -674,6 +696,8 @@ class Crawler:
             "pages_ok": len(reachable),
             "internal_links_found": links_seen,
             "pages_with_no_links": no_links[:12],
+            "resumed": resumed,
+            "already_crawled_before_this_run": prior_work,
             "counts": {
                 "links_already_crawled": self._counts.get("already_seen", 0),
                 "links_dropped_asset_or_admin": assets,
@@ -766,7 +790,7 @@ class Crawler:
             "auth": self._auth_summary(),
             "render": self._render_summary(),
             "routes": self._route_report.as_dict() if self._route_report else None,
-            "diagnosis": self._diagnose(pages, seeds),
+            "diagnosis": self._diagnose(pages, seeds, resumed),
             "login_walls": sorted({p["url"] for p in pages if p.get("needs_login")}),
             "site": self.probe.as_dict() if self.probe else None,
             "config": {
